@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+apscheduler
+redis
+httpx
+gtfs-realtime-bindings

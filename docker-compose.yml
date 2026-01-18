@@ -1,0 +1,48 @@
+services:
+  redis:
+    image: redis:alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - urban-pulse
+
+  data-service:
+    build:
+      context: ./apps/data-service
+    depends_on:
+      - redis
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    networks:
+      - urban-pulse
+
+  realtime-gateway:
+    build:
+      context: ./apps/realtime-gateway
+    depends_on:
+      - redis
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PORT=3000
+    ports:
+      - "${GATEWAY_PORT:-3000}:3000"
+    networks:
+      - urban-pulse
+
+  web-client:
+    build:
+      context: ./apps/web-client
+    depends_on:
+      - realtime-gateway
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_WS_URL=ws://127.0.0.1:${GATEWAY_PORT:-3000}/ws
+    networks:
+      - urban-pulse
+
+networks:
+  urban-pulse:
+    driver: bridge
