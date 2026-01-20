@@ -220,8 +220,9 @@ export default function App() {
     new TripsLayer({
       id: "trips",
       data: validVehicles,
-      getPath: (d) => d.path.map((p) => [p[0], p[1]]),
-      getTimestamps: (d) => d.path.map((p) => p[2]),
+      getPath: (d: Vehicle): Array<[number, number]> =>
+        d.path.map(([lon, lat]) => [lon, lat]),
+      getTimestamps: (d: Vehicle) => d.path.map((p) => p[2]),
 
       // Color logic: Grey if stale, otherwise Red/Orange/Green based on delay
       getColor: (d) => {
@@ -361,23 +362,24 @@ export default function App() {
         initialViewState={INITIAL_VIEW_STATE}
         controller={true}
         layers={layers}
-        getTooltip={({ object }: PickingInfo<RenderedVehicle>) => {
-          if (!object) return null;
+        getTooltip={({ object }: PickingInfo) => {
+          const vehicle = object as RenderedVehicle | null | undefined;
+          if (!vehicle) return null;
 
           // Calculate time since the last real update of vehicle
           const realNow = Date.now() - startTime;
-          const lastTimestamp = object.path[object.path.length - 1][2];
+          const lastTimestamp = vehicle.path[vehicle.path.length - 1][2];
           const secondsAgo = (realNow - lastTimestamp) / 1000;
 
           return {
             html: `
               <div style="font-family: sans-serif; font-size: 12px; padding: 4px; color: #fff; background: #000;">
-                <strong style="font-size: 14px">Line ${object.line}</strong><br/>
-                <span style="color: ${object.delay > 180 ? "#e74c3c" : "#2ecc71"}">
-                  ${object.delay > 0 ? `+${Math.round(object.delay / 60)} min` : "On time"}
+                <strong style="font-size: 14px">Line ${vehicle.line}</strong><br/>
+                <span style="color: ${vehicle.delay > 180 ? "#e74c3c" : "#2ecc71"}">
+                  ${vehicle.delay > 0 ? `+${Math.round(vehicle.delay / 60)} min` : "On time"}
                 </span><br/>
-                <span style="color: #888; font-size: 10px">ID: ${object.id}</span><br/>
-                ${object.isStale ? "Stationary (Waiting)" : "Moving"}<br/>
+                <span style="color: #888; font-size: 10px">ID: ${vehicle.id}</span><br/>
+                ${vehicle.isStale ? "Stationary (Waiting)" : "Moving"}<br/>
                 Last update: ${Math.round(Math.max(0, secondsAgo))}s ago
               </div>
             `,
