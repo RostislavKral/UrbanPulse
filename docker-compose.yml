@@ -31,9 +31,9 @@ services:
     networks:
       - urban-pulse
 
-  web-client:
+  frontend:
     build:
-      context: ./apps/web-client
+      context: ./apps/frontend
     depends_on:
       - realtime-gateway
     ports:

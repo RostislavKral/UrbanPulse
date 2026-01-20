@@ -9,6 +9,7 @@
     "preview": "vite preview --host 0.0.0.0 --port 5173"
   },
   "dependencies": {
+    "@deck.gl/geo-layers": "^8.9.36",
     "deck.gl": "^8.9.36",
     "maplibre-gl": "^3.6.2",
     "react": "^18.2.0",
