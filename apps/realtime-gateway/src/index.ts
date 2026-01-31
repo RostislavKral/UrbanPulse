@@ -1,7 +1,45 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import Redis from "ioredis";
+import fs from "node:fs";
+import path from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
+
+function loadRootEnv(): void {
+  const startDirs = [process.cwd(), __dirname];
+
+  for (const startDir of startDirs) {
+    let current = startDir;
+    for (let i = 0; i < 8; i++) {
+      const candidate = path.join(current, ".env");
+      if (fs.existsSync(candidate)) {
+        const lines = fs.readFileSync(candidate, "utf8").split(/\r?\n/);
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line || line.startsWith("#")) continue;
+          const normalized = line.startsWith("export ")
+            ? line.slice("export ".length).trim()
+            : line;
+          const eqIndex = normalized.indexOf("=");
+          if (eqIndex === -1) continue;
+          const key = normalized.slice(0, eqIndex).trim();
+          const value = normalized
+            .slice(eqIndex + 1)
+            .trim()
+            .replace(/^['"]|['"]$/g, "");
+          if (key && process.env[key] === undefined) process.env[key] = value;
+        }
+        return;
+      }
+
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+}
+
+loadRootEnv();
 
 const redisHost = process.env.REDIS_HOST ?? "localhost";
 const redisPort = Number.parseInt(process.env.REDIS_PORT ?? "6379", 10);

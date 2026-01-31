@@ -8,8 +8,8 @@ import { useLiveVehicles } from "./hooks/useLiveVehicles";
 import { RenderedVehicle, Vehicle } from "./types/vehicle";
 
 // --- CONFIGURATION ---
-// TODO: Move to .env
-const WS_URL = "ws://127.0.0.1:3000/ws";
+const WS_URL =
+  import.meta.env.VITE_WS_URL?.toString() ?? "ws://127.0.0.1:3000/ws";
 const MAP_STYLE =
   "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
 
