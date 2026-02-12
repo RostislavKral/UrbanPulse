@@ -41,7 +41,7 @@ function loadRootEnv(): void {
 
 loadRootEnv();
 
-const redisHost = process.env.REDIS_HOST ?? "localhost";
+const redisHost = process.env.REDIS_HOST ?? "127.0.0.1";
 const redisPort = Number.parseInt(process.env.REDIS_PORT ?? "6379", 10);
 const serverPort = Number.parseInt(process.env.PORT ?? "3000", 10);
 
@@ -58,6 +58,10 @@ const startServer = async () => {
   // Redis
   const redis = new Redis({ host: redisHost, port: redisPort });
   const clients = new Set<WebSocket>();
+
+  redis.on("error", (err) => {
+    app.log.error({ err }, "Redis error");
+  });
 
   redis.subscribe("urban_pulse:updates", (err) => {
     if (err) app.log.error("Redis sub failed");

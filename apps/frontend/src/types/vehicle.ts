@@ -1,6 +1,16 @@
 /**
  * Represents the state of a single public transport vehicle in the visualization.
  */
+// TODO(mode): Add/adjust variants as you decide to support.
+export type VehicleMode =
+  | "tram"
+  | "metro"
+  | "rail"
+  | "bus"
+  | "ferry"
+  | "trolleybus"
+  | "unknown";
+
 export interface Vehicle {
   /** Unique identifier provided by the source API (Golemio). */
   id: string;
@@ -16,6 +26,12 @@ export interface Vehicle {
 
   /** Current delay in seconds relative to the schedule. Positive values indicate late arrival. */
   delay: number;
+
+  /** TODO(mode): Set from backend payload once route_type mapping is implemented in data-service. */
+  route_type?: number;
+
+  /** TODO(mode): Normalized transport mode derived from GTFS route_type. */
+  mode?: VehicleMode;
 
   /** * Historical trajectory of the vehicle used for rendering trails.
    * Format: [longitude, latitude, relativeTimestamp]

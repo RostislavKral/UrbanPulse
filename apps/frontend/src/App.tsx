@@ -7,6 +7,13 @@ import Map from "react-map-gl/maplibre";
 import { useLiveVehicles } from "./hooks/useLiveVehicles";
 import { RenderedVehicle, Vehicle } from "./types/vehicle";
 
+// TODO(mode): Replace with your final visual language per transport mode.
+// Suggested defaults:
+// tram=red, metro=green, rail=violet, bus=blue, ferry=cyan, trolleybus=orange
+const MODE_COLORS: Record<string, [number, number, number]> = {
+  unknown: [180, 180, 180],
+};
+
 // --- CONFIGURATION ---
 const WS_URL =
   import.meta.env.VITE_WS_URL?.toString() ?? "ws://127.0.0.1:3000/ws";
@@ -224,7 +231,8 @@ export default function App() {
         d.path.map(([lon, lat]) => [lon, lat]),
       getTimestamps: (d: Vehicle) => d.path.map((p) => p[2]),
 
-      // Color logic: Grey if stale, otherwise Red/Orange/Green based on delay
+      // TODO(mode): switch trail color to transport mode, then apply delay as brightness/alpha.
+      // Current logic: Grey if stale, otherwise Red/Orange/Green based on delay.
       getColor: (d) => {
         const lastTime = d.path[d.path.length - 1][2];
         const isStale = playbackTime > lastTime;
@@ -259,7 +267,9 @@ export default function App() {
       getFillColor: [255, 255, 255, 255],
       pickable: true,
 
-      // Outline color: Same logic as trails
+      // TODO(mode): use mode-based outline color and shape/radius per mode.
+      // e.g. metro larger head, tram medium, bus small.
+      // Current outline color: delay-based.
       getLineColor: (d: RenderedVehicle) => {
         if (d.delay < 60) return [46, 204, 113];
         if (d.delay < 180) return [243, 156, 18];
@@ -375,6 +385,7 @@ export default function App() {
             html: `
               <div style="font-family: sans-serif; font-size: 12px; padding: 4px; color: #fff; background: #000;">
                 <strong style="font-size: 14px">Line ${vehicle.line}</strong><br/>
+                <!-- TODO(mode): show mode + route_type in tooltip once available -->
                 <span style="color: ${vehicle.delay > 180 ? "#e74c3c" : "#2ecc71"}">
                   ${vehicle.delay > 0 ? `+${Math.round(vehicle.delay / 60)} min` : "On time"}
                 </span><br/>

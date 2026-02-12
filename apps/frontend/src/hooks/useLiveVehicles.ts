@@ -126,6 +126,10 @@ export function useLiveVehicles(wsUrl: string): UseLiveVehiclesResult {
         const id = String(data.id ?? "");
         const lat = Number(data.lat);
         const lon = Number(data.lon);
+        // TODO(mode): Validate/normalize mode fields coming from backend:
+        // - route_type should be numeric when present
+        // - mode should be a known VehicleMode value
+        // Keep unknown values as "unknown" so rendering stays robust.
 
         // Validation
         if (!id || !Number.isFinite(lat) || !Number.isFinite(lon)) {

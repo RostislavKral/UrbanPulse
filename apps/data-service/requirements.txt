@@ -4,3 +4,4 @@ apscheduler
 redis
 httpx
 gtfs-realtime-bindings
+asyncpg
