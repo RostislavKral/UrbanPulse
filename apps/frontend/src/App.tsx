@@ -3,20 +3,16 @@ import { ScatterplotLayer } from "@deck.gl/layers";
 import { DeckGL, PickingInfo } from "deck.gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { useEffect, useMemo, useRef, useState } from "react";
-import Map from "react-map-gl/maplibre";
+import MapView from "react-map-gl/maplibre";
 import { useLiveVehicles } from "./hooks/useLiveVehicles";
 import { RenderedVehicle, Vehicle } from "./types/vehicle";
-
-// TODO(mode): Replace with your final visual language per transport mode.
-// Suggested defaults:
-// tram=red, metro=green, rail=violet, bus=blue, ferry=cyan, trolleybus=orange
-const MODE_COLORS: Record<string, [number, number, number]> = {
-  unknown: [180, 180, 180],
-};
 
 // --- CONFIGURATION ---
 const WS_URL =
   import.meta.env.VITE_WS_URL?.toString() ?? "ws://127.0.0.1:3000/ws";
+
+const API_URL = "http://127.0.0.1:8000";
+
 const MAP_STYLE =
   "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
 
@@ -28,42 +24,23 @@ const INITIAL_VIEW_STATE = {
   bearing: 0,
 };
 
-/**
- * Playback delay in milliseconds (30 seconds).
- * Creates a buffer allowing the system to interpolate movement between past points.
- * A higher value results in smoother movement but higher latency.
- */
+// Live mode playback offset for smoother motion.
 const PLAYBACK_DELAY_MS = 30000;
 
-/**
- * Length of the visual trail behind the vehicle in milliseconds (2.5 minutes).
- */
+// Visual trail duration.
 const TRAIL_LENGTH_MS = 150000;
 
-/**
- * Threshold to consider a vehicle "dead" (5 minutes).
- * If no data is received for this duration, the vehicle is removed from the map.
- */
+// Drop vehicles with stale data.
 const DROP_THRESHOLD_MS = 5 * 60 * 1000;
 
-/**
- * Linear interpolation factor for visual smoothing (0.0 - 1.0).
- * Lower values = smoother, heavier feel (slower to react to jumps).
- * Higher values = snappier, more jittery.
- */
+// Render-side smoothing factor.
 const SMOOTHING_FACTOR = 0.1;
 
 // --- HELPER FUNCTIONS ---
 
-/**
- * Linear Interpolation function.
- */
 const lerp = (start: number, end: number, factor: number): number =>
   start + (end - start) * factor;
 
-/**
- * Type guard to ensure a point has valid [lon, lat, timestamp] coordinates.
- */
 const isValidPoint = (point: unknown): point is [number, number, number] =>
   Array.isArray(point) && point.length >= 3;
 
@@ -72,13 +49,33 @@ interface TargetPositionResult {
   isStale: boolean;
 }
 
-/**
- * Calculates the target position of a vehicle at a specific playback time.
- * Handles three states:
- * 1. Dead/Zombie (expired data) -> returns null.
- * 2. Waiting (caught up to latest data) -> returns last known position (stale).
- * 3. Moving (between two known points) -> returns interpolated position.
- */
+type ViewMode = "live" | "replay";
+type ReplayMeta = {
+  start_ts: string;
+  end_ts: string;
+  vehicle_id: string | null;
+  mode: string | null;
+  requested_limit: number;
+  returned_count: number;
+  has_more: boolean;
+  query_time_ms: number;
+};
+type ReplayPointState = "observed" | "interpolated" | "invalid_gap";
+type ReplayConfidence = "high" | "medium" | "low";
+type ReplayRow = {
+  time: string;
+  vehicle_id: string;
+  lat: number;
+  lon: number;
+  point_state: ReplayPointState;
+  confidence: ReplayConfidence;
+  interpolation_method: string | null;
+  gap_reason: string | null;
+  route_id: string | null;
+  trip_id: string | null;
+  mode: string | null;
+};
+
 function getTargetPosition(
   path: Array<[number, number, number]>,
   currentTime: number,
@@ -132,17 +129,101 @@ function getTargetPosition(
 // --- MAIN COMPONENT ---
 
 export default function App() {
-  const { vehicles, isConnected, startTime } = useLiveVehicles(WS_URL);
+  const [viewMode, setViewMode] = useState<ViewMode>("live");
+  const { vehicles, isConnected, startTime } = useLiveVehicles(
+    WS_URL,
+    viewMode === "live",
+  );
+  const [replayVehicles, setReplayVehicles] = useState<Vehicle[]>([]);
+  const [replayStartTime, setReplayStartTime] = useState<number>(Date.now());
+  const [replayMeta, setReplayMeta] = useState<ReplayMeta | null>(null);
 
-  // Stores the last rendered visual position for every vehicle ID.
-  // This allows us to apply LERP smoothing between the current visual state
-  // and the new logical target state.
+  const activeVehicles = viewMode === "live" ? vehicles : replayVehicles;
+
+  const loadReplay = async () => {
+    const limit = 20000;
+    const end = Date.now();
+    const start = end - 60 * 1000;
+
+    const endIso = new Date(end).toISOString();
+    const startIso = new Date(start).toISOString();
+
+    const response = await fetch(
+      `${API_URL}/replay?start_ts=${encodeURIComponent(startIso)}&end_ts=${encodeURIComponent(endIso)}&limit=${limit}`,
+    );
+    if (!response.ok) {
+      throw new Error(`Replay fetch failed: ${response.status}`);
+    }
+
+    const replayResponse = await response.json();
+    const replayRows: ReplayRow[] = Array.isArray(replayResponse)
+      ? replayResponse
+      : Array.isArray(replayResponse?.data)
+        ? replayResponse.data
+        : [];
+    setReplayMeta(Array.isArray(replayResponse) ? null : replayResponse?.meta ?? null);
+
+    const grouped = new Map<string, ReplayRow[]>();
+
+    for (const row of replayRows) {
+      const key = row.vehicle_id;
+      const current = grouped.get(key);
+      if (current) {
+        current.push(row);
+      } else {
+        grouped.set(key, [row]);
+      }
+    }
+
+    for (const rows of grouped.values()) {
+      rows.sort((a, b) => a.time.localeCompare(b.time));
+    }
+
+    const nextReplayVehicles: Vehicle[] = [];
+
+    for (const [vehicleId, rows] of grouped.entries()) {
+      if (rows.length < 1) continue;
+
+      const path: Array<[number, number, number]> = [];
+
+      for (const row of rows) {
+        if (row.point_state === "invalid_gap") continue;
+        const point: [number, number, number] = [
+          row.lon,
+          row.lat,
+          new Date(row.time).getTime() - start,
+        ];
+        path.push(point);
+      }
+      if (path.length < 1) continue;
+
+      const last = rows[rows.length - 1];
+      const updatedAt = path[path.length - 1][2];
+      const vehicle: Vehicle = {
+        id: vehicleId,
+        lat: last.lat,
+        lon: last.lon,
+        line: last.route_id ?? "unknown",
+        delay: 0,
+        mode: last.mode ?? "unknown",
+        updatedAt,
+        path,
+      };
+
+      nextReplayVehicles.push(vehicle);
+    }
+
+    setReplayVehicles(nextReplayVehicles);
+    setReplayStartTime(Date.now());
+    setViewMode("replay");
+  };
+
+  // Last rendered positions per vehicle for smoothing.
   const visualPositionsRef = useRef<Record<string, [number, number]>>({});
 
-  // State used to force a re-render on every animation frame.
+  // Incremented on each animation frame.
   const [frameTick, setFrameTick] = useState(0);
 
-  // Animation Loop
   useEffect(() => {
     let animationFrameId: number;
     const animate = () => {
@@ -153,32 +234,28 @@ export default function App() {
     return () => cancelAnimationFrame(animationFrameId);
   }, []);
 
-  // Calculate current playback time relative to application start
-  const playbackTime = Math.max(0, Date.now() - startTime - PLAYBACK_DELAY_MS);
+  const activeStartTime = viewMode === "live" ? startTime : replayStartTime;
+  const activePlaybackDelay = viewMode === "live" ? PLAYBACK_DELAY_MS : 0;
+  const playbackTime = Math.max(0, Date.now() - activeStartTime - activePlaybackDelay);
 
-  // Data Preparation & Validation
   const validVehicles = useMemo(() => {
-    return vehicles
+    return activeVehicles
       .map((vehicle) => {
         const cleanPath = (vehicle.path || []).filter(isValidPoint);
         if (cleanPath.length < 1) return null;
         return { ...vehicle, path: cleanPath };
       })
       .filter((v): v is Vehicle => v !== null);
-  }, [vehicles]);
+  }, [activeVehicles]);
 
-  // Position Calculation (Logic + Smoothing)
-  // This runs on every frame tick to ensure smooth movement.
   const renderedVehicles = useMemo(() => {
     const currentVisuals = visualPositionsRef.current;
 
     return validVehicles
       .map((v) => {
-        // Determine logical position based on history
         const targetData = getTargetPosition(v.path, playbackTime);
 
         if (!targetData) {
-          // Cleanup visual state if vehicle expired
           delete currentVisuals[v.id];
           return null;
         }
@@ -187,18 +264,12 @@ export default function App() {
         let currentPos = currentVisuals[v.id];
 
         if (!currentPos) {
-          // New vehicle: snap immediately to target
           currentPos = targetPos;
         } else {
-          // Existing vehicle: Apply LERP smoothing
-
-          // Calculate squared distance to detect massive jumps (teleportation)
           const distSq =
             Math.pow(targetPos[0] - currentPos[0], 2) +
             Math.pow(targetPos[1] - currentPos[1], 2);
 
-          // Threshold approx 300-500m. If the jump is too large, teleport instead of smoothing
-          // to avoid vehicles flying across the map.
           if (distSq > 0.00005) {
             currentPos = targetPos;
           } else {
@@ -209,7 +280,6 @@ export default function App() {
           }
         }
 
-        // Update visual state reference
         currentVisuals[v.id] = currentPos;
 
         return {
@@ -221,9 +291,7 @@ export default function App() {
       .filter((v): v is RenderedVehicle => v !== null);
   }, [validVehicles, playbackTime, frameTick]);
 
-  // --- LAYERS ---
   const layers = [
-    // Layer 1: "Historical" Trails
     new TripsLayer({
       id: "trips",
       data: validVehicles,
@@ -231,8 +299,6 @@ export default function App() {
         d.path.map(([lon, lat]) => [lon, lat]),
       getTimestamps: (d: Vehicle) => d.path.map((p) => p[2]),
 
-      // TODO(mode): switch trail color to transport mode, then apply delay as brightness/alpha.
-      // Current logic: Grey if stale, otherwise Red/Orange/Green based on delay.
       getColor: (d) => {
         const lastTime = d.path[d.path.length - 1][2];
         const isStale = playbackTime > lastTime;
@@ -251,7 +317,6 @@ export default function App() {
       shadowEnabled: false,
     }),
 
-    // Layer 2: Vehicle Heads (Dots)
     new ScatterplotLayer({
       id: "vehicles-head",
       data: renderedVehicles,
@@ -267,9 +332,6 @@ export default function App() {
       getFillColor: [255, 255, 255, 255],
       pickable: true,
 
-      // TODO(mode): use mode-based outline color and shape/radius per mode.
-      // e.g. metro larger head, tram medium, bus small.
-      // Current outline color: delay-based.
       getLineColor: (d: RenderedVehicle) => {
         if (d.delay < 60) return [46, 204, 113];
         if (d.delay < 180) return [243, 156, 18];
@@ -278,7 +340,6 @@ export default function App() {
 
       parameters: { depthTest: false },
 
-      // Ensure colors update immediately when delay or state changes
       updateTriggers: {
         getFillColor: [playbackTime],
         getLineColor: [playbackTime],
@@ -295,7 +356,6 @@ export default function App() {
         background: "#111",
       }}
     >
-      {/* UI OVERLAY */}
       <div
         style={{
           position: "absolute",
@@ -325,12 +385,22 @@ export default function App() {
               width: 10,
               height: 10,
               borderRadius: "50%",
-              background: isConnected ? "#2ecc71" : "#e74c3c",
-              boxShadow: isConnected ? "0 0 8px #2ecc71" : "none",
+              background:
+                viewMode === "live"
+                  ? isConnected
+                    ? "#2ecc71"
+                    : "#e74c3c"
+                  : "#3498db",
+              boxShadow:
+                viewMode === "live" && isConnected ? "0 0 8px #2ecc71" : "none",
             }}
           />
           <span style={{ fontWeight: "bold", letterSpacing: "1px" }}>
-            {isConnected ? "PRAGUE LIVE" : "DISCONNECTED"}
+            {viewMode === "live"
+              ? isConnected
+                ? "PRAGUE LIVE"
+                : "DISCONNECTED"
+              : "PRAGUE REPLAY"}
           </span>
         </div>
 
@@ -354,6 +424,23 @@ export default function App() {
               {renderedVehicles.filter((v) => v.isStale).length}
             </span>
           </div>
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={() => setViewMode("live")}
+              style={{ opacity: viewMode === "live" ? 1 : 0.6 }}
+            >
+              Live
+            </button>
+            <button
+              onClick={() => loadReplay()}
+              style={{ opacity: viewMode === "replay" ? 1 : 0.6 }}
+            >
+              Replay
+            </button>
+          </div>
+          Mode: {viewMode.charAt(0).toUpperCase()}
+          {viewMode.substring(1, viewMode.length)}
         </div>
 
         <div
@@ -366,6 +453,21 @@ export default function App() {
         >
           Buffer: {PLAYBACK_DELAY_MS / 1000}s | Trail: {TRAIL_LENGTH_MS / 1000}s
         </div>
+        {viewMode === "replay" && replayMeta && (
+          <div
+            style={{
+              marginTop: "8px",
+              borderTop: "1px solid #444",
+              paddingTop: "6px",
+              fontSize: "10px",
+              color: "#cfd8dc",
+            }}
+          >
+            Replay: {replayMeta.returned_count}/{replayMeta.requested_limit} |
+            has_more: {String(replayMeta.has_more)} | db: {replayMeta.query_time_ms}
+            ms
+          </div>
+        )}
       </div>
 
       <DeckGL
@@ -376,8 +478,8 @@ export default function App() {
           const vehicle = object as RenderedVehicle | null | undefined;
           if (!vehicle) return null;
 
-          // Calculate time since the last real update of vehicle
-          const realNow = Date.now() - startTime;
+          const realNow =
+            viewMode === "live" ? Date.now() - startTime : playbackTime;
           const lastTimestamp = vehicle.path[vehicle.path.length - 1][2];
           const secondsAgo = (realNow - lastTimestamp) / 1000;
 
@@ -385,7 +487,6 @@ export default function App() {
             html: `
               <div style="font-family: sans-serif; font-size: 12px; padding: 4px; color: #fff; background: #000;">
                 <strong style="font-size: 14px">Line ${vehicle.line}</strong><br/>
-                <!-- TODO(mode): show mode + route_type in tooltip once available -->
                 <span style="color: ${vehicle.delay > 180 ? "#e74c3c" : "#2ecc71"}">
                   ${vehicle.delay > 0 ? `+${Math.round(vehicle.delay / 60)} min` : "On time"}
                 </span><br/>
@@ -397,7 +498,7 @@ export default function App() {
           };
         }}
       >
-        <Map mapStyle={MAP_STYLE} />
+        <MapView mapStyle={MAP_STYLE} />
       </DeckGL>
     </div>
   );

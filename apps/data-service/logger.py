@@ -7,15 +7,21 @@ This script subscribes to Redis updates and persists them into TimescaleDB
 import asyncio
 import json
 import logging
+import math
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
 import asyncpg
 import redis.asyncio as redis
 
+INTERP_MIN_SECONDS = 2
+INTERP_MAX_SECONDS = 30
+MAX_GAP_SECONDS = 45
+MAX_SPEED_MPS = 40
+R = 6371.0
 BATCH_SIZE = 100
 FLUSH_INTERVAL = 1.0
 REDIS_CHANNEL = "urban_pulse:updates"
@@ -132,6 +138,20 @@ async def init_db(pool: asyncpg.Pool) -> None:
                 next_stop_arrival_time    TIMESTAMPTZ,
                 next_stop_departure_time  TIMESTAMPTZ
             );
+
+            CREATE TABLE IF NOT EXISTS vehicle_trajectory_points (
+            time TIMESTAMPTZ NOT NULL,
+            vehicle_id TEXT NOT NULL,
+            lat DOUBLE PRECISION NOT NULL,
+            lon DOUBLE PRECISION NOT NULL,
+            point_state TEXT NOT NULL,            -- observed|interpolated|invalid_gap
+            confidence TEXT NOT NULL,             -- high|medium|low
+            interpolation_method TEXT,            -- linear|speed_constrained|null
+            gap_reason TEXT,                      -- speed_violation|dropout|out_of_order|null
+            route_id TEXT,
+            trip_id TEXT,
+            mode TEXT
+            );
         """
         )
 
@@ -158,6 +178,9 @@ async def init_db(pool: asyncpg.Pool) -> None:
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_vehicle_id ON vehicle_positions (vehicle_id, time DESC);"
         )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_traj_vehicle_time ON vehicle_trajectory_points (vehicle_id, time DESC);"
+        )
 
         try:
             await conn.execute(
@@ -167,13 +190,7 @@ async def init_db(pool: asyncpg.Pool) -> None:
         except Exception:
             logger.info("TimescaleDB extension not available; using a standard table.")
 
-
-async def flush_buffer(
-    pool: asyncpg.Pool,
-    buffer: list[VehicleRow],
-) -> None:
-    """Flush buffered rows to the database."""
-
+async def flush_buffer(pool: asyncpg.Pool, buffer: list[VehicleRow]) -> None:
     if not buffer:
         return
 
@@ -209,7 +226,40 @@ async def flush_buffer(
             )
         logger.info("Flushed %d records to the database.", len(buffer))
     except Exception as exc:
-        logger.error("Failed to flush buffer: %s", exc)
+        logger.error("Failed to flush vehicle position buffer: %s", exc)
+
+async def flush_trajectory_buffer(
+    pool: asyncpg.Pool,
+    buffer: list,
+) -> None:
+    """Flush buffered rows to the database."""
+
+    if not buffer:
+        return
+
+    try:
+        async with pool.acquire() as conn:
+            await conn.copy_records_to_table(
+                "vehicle_trajectory_points",
+                records=buffer,
+                columns=[
+                    "time",
+                    "vehicle_id",
+                    "lat",
+                    "lon",
+                    "point_state",
+                    "confidence",
+                    "interpolation_method",
+                    "gap_reason",
+                    "route_id",
+                    "trip_id",
+                    "mode",
+                ],
+                timeout=10,
+            )
+        logger.info("Flushed %d trajectory records to the database.", len(buffer))
+    except Exception as exc:
+        logger.error("Failed to flush trajectory buffer: %s", exc)
 
 
 def _parse_message_data(message: dict[str, Any]) -> dict[str, Any] | None:
@@ -281,6 +331,40 @@ def _to_optional_timestamp(value: Any) -> datetime | None:
         return None
 
 
+def distance_meters(lat1, lon1, lat2, lon2):
+    """Great-circle distance in meters."""
+    lati1 = math.radians(lat1)
+    long1 = math.radians(lon1)
+    lati2 = math.radians(lat2)
+    long2 = math.radians(lon2)
+    dlon = long2 - long1
+    dlati = lati2 - lati1
+    a = (
+        math.sin(dlati / 2) ** 2
+        + math.cos(lati1) * math.cos(lati2) * math.sin(dlon / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    distance = R * c
+    return distance * 1000
+
+
+def classify_segment(prev_t, prev_lat, prev_lon, cur_t, cur_lat, cur_lon):
+    dt = (cur_t - prev_t).total_seconds()
+
+    if dt <= 0:
+        return "invalid_gap", "low", None, "out_of_order"
+
+    dist_m = distance_meters(prev_lat, prev_lon, cur_lat, cur_lon)
+    speed = dist_m / dt
+
+    if dt > MAX_GAP_SECONDS:
+        return "invalid_gap", "low", None, "dropout"
+    if speed > MAX_SPEED_MPS:
+        return "invalid_gap", "low", None, "speed_violation"
+
+    return "observed", "high", "linear", None
+
+
 async def main() -> None:
     """Run the Redis-to-Postgres ingestion loop."""
 
@@ -302,7 +386,9 @@ async def main() -> None:
         logger.info("Subscribed to Redis channel: %s", REDIS_CHANNEL)
 
         buffer: list[VehicleRow] = []
+        trajectory_buffer = []
         last_flush_time = time.time()
+        last_seen_by_vehicle: dict[str, tuple[datetime, float, float]] = {}
 
         while True:
             message = await pubsub.get_message(
@@ -311,7 +397,22 @@ async def main() -> None:
             )
             if message:
                 payload = _parse_message_data(message)
+
                 if payload:
+                    vehicle_id = str(payload["id"])
+
+                    cur_t = _to_optional_timestamp(payload.get("observation_ts")) or datetime.now(
+                        timezone.utc
+                    )
+                    cur_lat = float(payload["lat"])
+                    cur_lon = float(payload["lon"])
+
+                    state = "observed"
+                    confidence = "high"
+                    method: str | None = None
+                    gap_reason: str | None = None
+                    prev = last_seen_by_vehicle.get(vehicle_id)
+
                     try:
                         buffer.append(
                             (
@@ -338,8 +439,61 @@ async def main() -> None:
                                 _to_optional_timestamp(payload.get("next_stop_departure_time")),
                             )
                         )
+
+                        if prev is not None:
+                            prev_t, prev_lat, prev_lon = prev
+
+                            state, confidence, method, gap_reason = classify_segment(
+                                prev_t, prev_lat, prev_lon, cur_t, cur_lat, cur_lon
+                            )
+
+                            interpolated_rows = []
+                            dt = (cur_t - prev_t).total_seconds()
+
+                            if state == "observed" and INTERP_MIN_SECONDS <= dt <= INTERP_MAX_SECONDS:
+                                for s in range(1, int(dt)):
+                                    ratio = s / dt
+                                    i_lat = prev_lat + (cur_lat - prev_lat) * ratio
+                                    i_lon = prev_lon + (cur_lon - prev_lon) * ratio
+                                    i_t = prev_t + timedelta(seconds=s)
+
+                                    interpolated_rows.append((
+                                        i_t,
+                                        vehicle_id,
+                                        i_lat,
+                                        i_lon,
+                                        "interpolated",
+                                        "medium",
+                                        "linear",
+                                        None,
+                                        _to_optional_text(payload.get("route_id")),
+                                        _to_optional_text(payload.get("trip_id")),
+                                        _to_optional_text(payload.get("mode")),
+                                    ))
+                                trajectory_buffer.extend(interpolated_rows)
+
+                        trajectory_buffer.append(
+                            (
+                                cur_t,
+                                vehicle_id,
+                                cur_lat,
+                                cur_lon,
+                                state,
+                                confidence,
+                                method,
+                                gap_reason,
+                                _to_optional_text(payload.get("route_id")),
+                                _to_optional_text(payload.get("trip_id")),
+                                _to_optional_text(payload.get("mode")),
+                            )
+                        )
+                        last_seen_by_vehicle[vehicle_id] = (cur_t, cur_lat, cur_lon)
                     except (TypeError, ValueError):
-                        pass
+                        logger.warning(
+                            "Failed to buffer payload for vehicle_id=%s",
+                            vehicle_id,
+                            exc_info=True,
+                        )
 
             now = time.time()
             should_flush = len(buffer) >= BATCH_SIZE or (
@@ -347,8 +501,11 @@ async def main() -> None:
             )
             if should_flush and pool:
                 await flush_buffer(pool, buffer)
+                await flush_trajectory_buffer(pool, trajectory_buffer)
+                trajectory_buffer = []
                 buffer = []
                 last_flush_time = now
+
     except asyncio.CancelledError:
         raise
     except KeyboardInterrupt:

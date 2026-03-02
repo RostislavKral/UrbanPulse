@@ -9,12 +9,16 @@ import logging
 import os
 from csv import DictReader
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
+import asyncpg
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import Redis
 
 GOLEMIO_API_URL = "https://api.golemio.cz/v2/vehiclepositions?limit=3000"
@@ -76,6 +80,33 @@ def _get_api_key() -> str | None:
     """Return the API key for Golemio, if configured."""
 
     return os.getenv("GOLEMIO_API_KEY")
+
+
+def _get_db_url() -> str:
+    """Return a Postgres connection URL from environment variables."""
+
+    explicit = os.getenv("DATABASE_URL")
+    if explicit:
+        return explicit
+
+    required_keys = [
+        "POSTGRES_USER",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_HOST",
+        "POSTGRES_PORT",
+        "POSTGRES_DB",
+    ]
+    missing = [key for key in required_keys if not os.getenv(key)]
+    if missing:
+        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+
+    user = os.environ["POSTGRES_USER"]
+    password = os.environ["POSTGRES_PASSWORD"]
+    host = os.environ["POSTGRES_HOST"]
+    port = os.environ["POSTGRES_PORT"]
+    db = os.environ["POSTGRES_DB"]
+
+    return f"postgresql://{user}:{password}@{host}:{port}/{db}"
 
 
 async def fetch_data(client: httpx.AsyncClient) -> dict[str, Any] | None:
@@ -264,16 +295,22 @@ async def publish_updates() -> None:
                 "next_stop_sequence": next_stop.get("sequence"),
                 "next_stop_arrival_time": next_stop.get("arrival_time"),
                 "next_stop_departure_time": next_stop.get("departure_time"),
+                "ingest_ts": datetime.now(timezone.utc).isoformat(),
             }
+
+            payload["observation_ts"] = payload.get("origin_timestamp") or payload["ingest_ts"]
             await redis_client.publish(REDIS_CHANNEL, json.dumps(payload))
         except Exception as exc:
             logger.debug("Failed to process feature: %s", exc)
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(app: FastAPI):
     """Manage application startup/shutdown resources."""
 
+    app.state.db_pool = await asyncpg.create_pool(
+        _get_db_url(), min_size=1, max_size=10
+    )
     scheduler.add_job(publish_updates, "interval", seconds=PUBLISH_INTERVAL_SECONDS)
     scheduler.start()
     try:
@@ -281,10 +318,20 @@ async def lifespan(_: FastAPI):
     finally:
         scheduler.shutdown(wait=False)
         await redis_client.close()
+        db_pool = getattr(app.state, "db_pool", None)
+        if db_pool is not None:
+            await db_pool.close()
 
 
 ROUTE_TYPE_BY_ID = load_route_type_by_id()
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
@@ -292,3 +339,64 @@ async def health() -> dict[str, str]:
     """Healthcheck endpoint."""
 
     return {"status": "ok"}
+
+@app.get("/replay")
+async def replay(
+    request: Request,
+    start_ts: datetime,
+    end_ts: datetime,
+    vehicle_id: str | None = None,
+    mode: str | None = None,
+    limit: int = Query(5000, ge=1, le=20000),
+):
+
+    if end_ts <= start_ts:
+        raise HTTPException(status_code=400, detail="end_ts must be greater than start_ts")
+
+    sql = """
+        SELECT
+            time,
+            vehicle_id,
+            lat,
+            lon,
+            point_state,
+            confidence,
+            interpolation_method,
+            gap_reason,
+            route_id,
+            trip_id,
+            mode
+        FROM vehicle_trajectory_points
+        WHERE time >= $1 AND time < $2
+            AND ($3::text IS NULL OR vehicle_id = $3)
+            AND ($4::text IS NULL OR mode = $4)
+        ORDER BY time ASC
+        LIMIT $5
+        """
+
+    db_pool = getattr(request.app.state, "db_pool", None)
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database pool is not initialized")
+
+    query_started = perf_counter()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, start_ts, end_ts, vehicle_id, mode, limit + 1)
+    elapsed_ms = round((perf_counter() - query_started) * 1000.0, 2)
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    data = [dict(r) for r in rows]
+
+    return {
+        "meta": {
+            "start_ts": start_ts.isoformat(),
+            "end_ts": end_ts.isoformat(),
+            "vehicle_id": vehicle_id,
+            "mode": mode,
+            "requested_limit": limit,
+            "returned_count": len(data),
+            "has_more": has_more,
+            "query_time_ms": elapsed_ms,
+        },
+        "data": data,
+    }
