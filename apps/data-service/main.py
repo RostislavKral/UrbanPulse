@@ -348,12 +348,21 @@ async def replay(
     vehicle_id: str | None = None,
     mode: str | None = None,
     limit: int = Query(5000, ge=1, le=20000),
+    cursor_time: datetime | None = None,
+    cursor_vehicle_id: str | None = None,
 ):
+    """Return a stable, cursor-paginated replay slice for the requested time window."""
 
     if end_ts <= start_ts:
         raise HTTPException(status_code=400, detail="end_ts must be greater than start_ts")
 
-    sql = """
+    if (cursor_time is None) != (cursor_vehicle_id is None):
+        raise HTTPException(
+            status_code=400,
+            detail="cursor_time and cursor_vehicle_id must be provided together",
+        )
+
+    rows_sql = """
         SELECT
             time,
             vehicle_id,
@@ -370,8 +379,20 @@ async def replay(
         WHERE time >= $1 AND time < $2
             AND ($3::text IS NULL OR vehicle_id = $3)
             AND ($4::text IS NULL OR mode = $4)
-        ORDER BY time ASC
-        LIMIT $5
+            AND (
+                $5::timestamptz IS NULL
+                OR (time, vehicle_id) > ($5, $6)
+            )
+        ORDER BY time ASC, vehicle_id ASC
+        LIMIT $7
+        """
+
+    count_sql = """
+        SELECT COUNT(*)
+        FROM vehicle_trajectory_points
+        WHERE time >= $1 AND time < $2
+            AND ($3::text IS NULL OR vehicle_id = $3)
+            AND ($4::text IS NULL OR mode = $4)
         """
 
     db_pool = getattr(request.app.state, "db_pool", None)
@@ -380,12 +401,37 @@ async def replay(
 
     query_started = perf_counter()
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch(sql, start_ts, end_ts, vehicle_id, mode, limit + 1)
+        rows = await conn.fetch(
+            rows_sql,
+            start_ts,
+            end_ts,
+            vehicle_id,
+            mode,
+            cursor_time,
+            cursor_vehicle_id,
+            limit + 1,
+        )
+        total_count = None
+        if cursor_time is None:
+            total_count = await conn.fetchval(
+                count_sql,
+                start_ts,
+                end_ts,
+                vehicle_id,
+                mode,
+            )
     elapsed_ms = round((perf_counter() - query_started) * 1000.0, 2)
 
     has_more = len(rows) > limit
-    rows = rows[:limit]
-    data = [dict(r) for r in rows]
+    page_rows = rows[:limit]
+    data = [dict(r) for r in page_rows]
+
+    next_cursor_time = None
+    next_cursor_vehicle_id = None
+    if has_more and page_rows:
+        last_row = page_rows[-1]
+        next_cursor_time = last_row["time"].isoformat()
+        next_cursor_vehicle_id = last_row["vehicle_id"]
 
     return {
         "meta": {
@@ -395,8 +441,11 @@ async def replay(
             "mode": mode,
             "requested_limit": limit,
             "returned_count": len(data),
+            "total_count": int(total_count) if total_count is not None else None,
             "has_more": has_more,
             "query_time_ms": elapsed_ms,
+            "next_cursor_time": next_cursor_time,
+            "next_cursor_vehicle_id": next_cursor_vehicle_id,
         },
         "data": data,
     }

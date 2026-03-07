@@ -2,12 +2,11 @@ import { TripsLayer } from "@deck.gl/geo-layers";
 import { ScatterplotLayer } from "@deck.gl/layers";
 import { DeckGL, PickingInfo } from "deck.gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useEffect, useMemo, useRef, useState } from "react";
 import MapView from "react-map-gl/maplibre";
 import { useLiveVehicles } from "./hooks/useLiveVehicles";
-import { RenderedVehicle, Vehicle } from "./types/vehicle";
+import { RenderedVehicle, Vehicle, VehicleMode } from "./types/vehicle";
 
-// --- CONFIGURATION ---
 const WS_URL =
   import.meta.env.VITE_WS_URL?.toString() ?? "ws://127.0.0.1:3000/ws";
 
@@ -24,19 +23,10 @@ const INITIAL_VIEW_STATE = {
   bearing: 0,
 };
 
-// Live mode playback offset for smoother motion.
 const PLAYBACK_DELAY_MS = 30000;
-
-// Visual trail duration.
 const TRAIL_LENGTH_MS = 150000;
-
-// Drop vehicles with stale data.
 const DROP_THRESHOLD_MS = 5 * 60 * 1000;
-
-// Render-side smoothing factor.
 const SMOOTHING_FACTOR = 0.1;
-
-// --- HELPER FUNCTIONS ---
 
 const lerp = (start: number, end: number, factor: number): number =>
   start + (end - start) * factor;
@@ -57,8 +47,12 @@ type ReplayMeta = {
   mode: string | null;
   requested_limit: number;
   returned_count: number;
+  total_count: number | null;
+  loaded_count: number;
   has_more: boolean;
   query_time_ms: number;
+  next_cursor_time: string | null;
+  next_cursor_vehicle_id: string | null;
 };
 type ReplayPointState = "observed" | "interpolated" | "invalid_gap";
 type ReplayConfidence = "high" | "medium" | "low";
@@ -75,7 +69,122 @@ type ReplayRow = {
   trip_id: string | null;
   mode: string | null;
 };
+type ReplayFilters = {
+  mode: VehicleMode | "all";
+  lineQuery: string;
+  includeInterpolated: boolean;
+  hideVehiclesWithLatestInvalidGap: boolean;
+};
+type ReplayStats = {
+  observedPoints: number;
+  interpolatedPoints: number;
+  invalidGapPoints: number;
+  shownVehicles: number;
+};
 
+const REPLAY_MODES: Array<VehicleMode | "all"> = [
+  "all",
+  "tram",
+  "metro",
+  "rail",
+  "bus",
+  "ferry",
+  "trolleybus",
+  "unknown",
+];
+const DEFAULT_REPLAY_FILTERS: ReplayFilters = {
+  mode: "all",
+  lineQuery: "",
+  includeInterpolated: true,
+  hideVehiclesWithLatestInvalidGap: false,
+};
+const REPLAY_WINDOW_MINUTES = [1, 5, 15, 30];
+const REPLAY_PAGE_SIZE = 5000;
+const REPLAY_REFRESH_DEBOUNCE_MS = 150;
+
+function appendReplayRows(
+  grouped: Map<string, ReplayRow[]>,
+  rows: ReplayRow[],
+): void {
+  for (const row of rows) {
+    const current = grouped.get(row.vehicle_id);
+    if (current) {
+      current.push(row);
+    } else {
+      grouped.set(row.vehicle_id, [row]);
+    }
+  }
+}
+
+// Collapse raw replay rows into renderable vehicle paths after applying UI filters.
+function buildReplayVehicles(
+  grouped: Map<string, ReplayRow[]>,
+  replayStartMs: number,
+  filters: ReplayFilters,
+): { vehicles: Vehicle[]; stats: ReplayStats } {
+  const nextReplayVehicles: Vehicle[] = [];
+  const stats: ReplayStats = {
+    observedPoints: 0,
+    interpolatedPoints: 0,
+    invalidGapPoints: 0,
+    shownVehicles: 0,
+  };
+
+  for (const [vehicleId, vehicleRows] of grouped.entries()) {
+    if (vehicleRows.length < 1) continue;
+
+    const last = vehicleRows[vehicleRows.length - 1];
+    const mode = (last.mode ?? "unknown") as VehicleMode;
+    const line = last.route_id ?? "unknown";
+    const latestPointIsInvalidGap = last.point_state === "invalid_gap";
+
+    if (filters.mode !== "all" && mode !== filters.mode) continue;
+    if (
+      filters.lineQuery &&
+      !line.toLowerCase().includes(filters.lineQuery.toLowerCase())
+    ) {
+      continue;
+    }
+    if (filters.hideVehiclesWithLatestInvalidGap && latestPointIsInvalidGap) {
+      continue;
+    }
+
+    const path: Array<[number, number, number]> = [];
+
+    for (const row of vehicleRows) {
+      if (row.point_state === "invalid_gap") {
+        stats.invalidGapPoints += 1;
+        continue;
+      }
+      if (row.point_state === "interpolated") {
+        stats.interpolatedPoints += 1;
+        if (!filters.includeInterpolated) continue;
+      }
+      if (row.point_state === "observed") {
+        stats.observedPoints += 1;
+      }
+      path.push([row.lon, row.lat, new Date(row.time).getTime() - replayStartMs]);
+    }
+
+    if (path.length < 1) continue;
+
+    nextReplayVehicles.push({
+      id: vehicleId,
+      lat: last.lat,
+      lon: last.lon,
+      line,
+      delay: 0,
+      mode,
+      updatedAt: path[path.length - 1][2],
+      path,
+    });
+    stats.shownVehicles += 1;
+  }
+
+  return { vehicles: nextReplayVehicles, stats };
+}
+
+// Resolve the vehicle position for the current playback time within a sampled path.
 function getTargetPosition(
   path: Array<[number, number, number]>,
   currentTime: number,
@@ -85,13 +194,10 @@ function getTargetPosition(
   const lastPoint = path[path.length - 1];
   const lastTime = lastPoint[2];
 
-  // Check if data is expired
   if (currentTime - lastTime > DROP_THRESHOLD_MS) {
     return null;
   }
 
-  // Check if we have reached the end of the known history
-  // The vehicle is technically "waiting" for new data from the server.
   if (currentTime >= lastTime) {
     return {
       pos: [lastPoint[0], lastPoint[1]],
@@ -99,8 +205,6 @@ function getTargetPosition(
     };
   }
 
-  // Interpolate position within the history
-  // Search backwards for the relevant time segment.
   for (let i = path.length - 2; i >= 0; i--) {
     const startNode = path[i];
     const endNode = path[i + 1];
@@ -122,11 +226,8 @@ function getTargetPosition(
     }
   }
 
-  // Fallback: Return the start of history
   return { pos: [path[0][0], path[0][1]], isStale: false };
 }
-
-// --- MAIN COMPONENT ---
 
 export default function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("live");
@@ -135,108 +236,241 @@ export default function App() {
     viewMode === "live",
   );
   const [replayVehicles, setReplayVehicles] = useState<Vehicle[]>([]);
-  const [replayStartTime, setReplayStartTime] = useState<number>(Date.now());
   const [replayMeta, setReplayMeta] = useState<ReplayMeta | null>(null);
+  const [isReplayPlaying, setIsReplayPlaying] = useState(true);
+  const [replaySpeed, setReplaySpeed] = useState(1);
+  const [replayElapsedMs, setReplayElapsedMs] = useState(0);
+  const [replayWindowDraftMinutes, setReplayWindowDraftMinutes] = useState(1);
+  const [activeReplayWindowMinutes, setActiveReplayWindowMinutes] = useState(1);
+  const [isReplayLoading, setIsReplayLoading] = useState(false);
+  const [replayError, setReplayError] = useState<string | null>(null);
+  const [replayFilters, setReplayFilters] =
+    useState<ReplayFilters>(DEFAULT_REPLAY_FILTERS);
+  const [replayStats, setReplayStats] = useState<ReplayStats>({
+    observedPoints: 0,
+    interpolatedPoints: 0,
+    invalidGapPoints: 0,
+    shownVehicles: 0,
+  });
+  const replayLoadIdRef = useRef(0);
+  const replayFiltersRef = useRef<ReplayFilters>(DEFAULT_REPLAY_FILTERS);
+  const replayRowsRef = useRef<Map<string, ReplayRow[]>>(new Map());
+  const replayStartMsRef = useRef(0);
+  const lastAnimationTimeRef = useRef<number | null>(null);
+  const replayRefreshTimerRef = useRef<number | null>(null);
 
   const activeVehicles = viewMode === "live" ? vehicles : replayVehicles;
-
-  const loadReplay = async () => {
-    const limit = 20000;
-    const end = Date.now();
-    const start = end - 60 * 1000;
-
-    const endIso = new Date(end).toISOString();
-    const startIso = new Date(start).toISOString();
-
-    const response = await fetch(
-      `${API_URL}/replay?start_ts=${encodeURIComponent(startIso)}&end_ts=${encodeURIComponent(endIso)}&limit=${limit}`,
+  const rebuildReplayVehicles = (
+    filters: ReplayFilters,
+    resetVisuals: boolean = false,
+  ) => {
+    const nextReplayState = buildReplayVehicles(
+      replayRowsRef.current,
+      replayStartMsRef.current,
+      filters,
     );
-    if (!response.ok) {
-      throw new Error(`Replay fetch failed: ${response.status}`);
+
+    startTransition(() => {
+      setReplayVehicles(nextReplayState.vehicles);
+      setReplayStats(nextReplayState.stats);
+    });
+
+    if (resetVisuals) {
+      visualPositionsRef.current = {};
     }
+  };
+  const scheduleReplayRefresh = () => {
+    if (replayRefreshTimerRef.current !== null) return;
 
-    const replayResponse = await response.json();
-    const replayRows: ReplayRow[] = Array.isArray(replayResponse)
-      ? replayResponse
-      : Array.isArray(replayResponse?.data)
-        ? replayResponse.data
-        : [];
-    setReplayMeta(Array.isArray(replayResponse) ? null : replayResponse?.meta ?? null);
-
-    const grouped = new Map<string, ReplayRow[]>();
-
-    for (const row of replayRows) {
-      const key = row.vehicle_id;
-      const current = grouped.get(key);
-      if (current) {
-        current.push(row);
-      } else {
-        grouped.set(key, [row]);
-      }
-    }
-
-    for (const rows of grouped.values()) {
-      rows.sort((a, b) => a.time.localeCompare(b.time));
-    }
-
-    const nextReplayVehicles: Vehicle[] = [];
-
-    for (const [vehicleId, rows] of grouped.entries()) {
-      if (rows.length < 1) continue;
-
-      const path: Array<[number, number, number]> = [];
-
-      for (const row of rows) {
-        if (row.point_state === "invalid_gap") continue;
-        const point: [number, number, number] = [
-          row.lon,
-          row.lat,
-          new Date(row.time).getTime() - start,
-        ];
-        path.push(point);
-      }
-      if (path.length < 1) continue;
-
-      const last = rows[rows.length - 1];
-      const updatedAt = path[path.length - 1][2];
-      const vehicle: Vehicle = {
-        id: vehicleId,
-        lat: last.lat,
-        lon: last.lon,
-        line: last.route_id ?? "unknown",
-        delay: 0,
-        mode: last.mode ?? "unknown",
-        updatedAt,
-        path,
-      };
-
-      nextReplayVehicles.push(vehicle);
-    }
-
-    setReplayVehicles(nextReplayVehicles);
-    setReplayStartTime(Date.now());
-    setViewMode("replay");
+    replayRefreshTimerRef.current = window.setTimeout(() => {
+      replayRefreshTimerRef.current = null;
+      rebuildReplayVehicles(replayFiltersRef.current);
+    }, REPLAY_REFRESH_DEBOUNCE_MS);
   };
 
-  // Last rendered positions per vehicle for smoothing.
-  const visualPositionsRef = useRef<Record<string, [number, number]>>({});
+  const loadReplay = async () => {
+    const limit = REPLAY_PAGE_SIZE;
+    const end = Date.now();
+    const start = end - replayWindowDraftMinutes * 60 * 1000;
+    const endIso = new Date(end).toISOString();
+    const startIso = new Date(start).toISOString();
+    const loadId = replayLoadIdRef.current + 1;
+    replayLoadIdRef.current = loadId;
+    let loadedCount = 0;
+    let cursorTime: string | null = null;
+    let cursorVehicleId: string | null = null;
+    let totalCount = 0;
 
-  // Incremented on each animation frame.
+    if (replayRefreshTimerRef.current !== null) {
+      window.clearTimeout(replayRefreshTimerRef.current);
+      replayRefreshTimerRef.current = null;
+    }
+    replayRowsRef.current = new Map();
+    replayStartMsRef.current = start;
+    setReplayVehicles([]);
+    setReplayMeta(null);
+    setIsReplayLoading(true);
+    setReplayError(null);
+    setReplayStats({
+      observedPoints: 0,
+      interpolatedPoints: 0,
+      invalidGapPoints: 0,
+      shownVehicles: 0,
+    });
+    setReplayElapsedMs(0);
+    setIsReplayPlaying(true);
+    setReplaySpeed(1);
+    setActiveReplayWindowMinutes(replayWindowDraftMinutes);
+    replayFiltersRef.current = DEFAULT_REPLAY_FILTERS;
+    setReplayFilters(DEFAULT_REPLAY_FILTERS);
+    lastAnimationTimeRef.current = null;
+    visualPositionsRef.current = {};
+
+    try {
+      while (true) {
+        const params = new URLSearchParams({
+          start_ts: startIso,
+          end_ts: endIso,
+          limit: String(limit),
+        });
+
+        if (cursorTime && cursorVehicleId) {
+          params.set("cursor_time", cursorTime);
+          params.set("cursor_vehicle_id", cursorVehicleId);
+        }
+
+        const response = await fetch(`${API_URL}/replay?${params.toString()}`);
+        if (!response.ok) {
+          throw new Error(`Replay fetch failed: ${response.status}`);
+        }
+
+        const replayResponse = (await response.json()) as {
+          data: ReplayRow[];
+          meta: ReplayMeta;
+        };
+
+        if (replayLoadIdRef.current !== loadId) {
+          return;
+        }
+
+        const pageRows = replayResponse.data;
+        const meta = replayResponse.meta;
+        loadedCount += pageRows.length;
+        totalCount = meta.total_count ?? totalCount;
+
+        appendReplayRows(replayRowsRef.current, pageRows);
+        setReplayMeta({
+          ...meta,
+          loaded_count: loadedCount,
+          total_count: totalCount,
+        });
+
+        if (loadedCount === pageRows.length) {
+          rebuildReplayVehicles(replayFiltersRef.current, true);
+          setViewMode("replay");
+        } else {
+          scheduleReplayRefresh();
+        }
+
+        if (!meta.has_more) {
+          rebuildReplayVehicles(replayFiltersRef.current);
+          setIsReplayLoading(false);
+          return;
+        }
+
+        if (!meta.next_cursor_time || !meta.next_cursor_vehicle_id) {
+          throw new Error("Replay pagination is missing cursor metadata");
+        }
+
+        cursorTime = meta.next_cursor_time;
+        cursorVehicleId = meta.next_cursor_vehicle_id;
+      }
+    } catch (error) {
+      if (replayLoadIdRef.current !== loadId) {
+        return;
+      }
+      setIsReplayLoading(false);
+      setReplayError(
+        error instanceof Error ? error.message : "Replay loading failed",
+      );
+    }
+  };
+
+  useEffect(() => {
+    replayFiltersRef.current = replayFilters;
+  }, [replayFilters]);
+
+  useEffect(() => {
+    if (viewMode !== "replay") return;
+
+    rebuildReplayVehicles(replayFilters, true);
+  }, [replayFilters, viewMode]);
+
+  useEffect(() => {
+    return () => {
+      if (replayRefreshTimerRef.current !== null) {
+        window.clearTimeout(replayRefreshTimerRef.current);
+      }
+    };
+  }, []);
+
+  const visualPositionsRef = useRef<Record<string, [number, number]>>({});
   const [frameTick, setFrameTick] = useState(0);
 
   useEffect(() => {
     let animationFrameId: number;
-    const animate = () => {
+    const animate = (now: number) => {
+      const previous = lastAnimationTimeRef.current;
+      lastAnimationTimeRef.current = now;
+
+      if (
+        previous !== null &&
+        viewMode === "replay" &&
+        isReplayPlaying
+      ) {
+        const deltaMs = now - previous;
+        setReplayElapsedMs((prev) => prev + deltaMs * replaySpeed);
+      }
+
       setFrameTick((prev) => prev + 1);
       animationFrameId = requestAnimationFrame(animate);
     };
     animationFrameId = requestAnimationFrame(animate);
-    return () => cancelAnimationFrame(animationFrameId);
-  }, []);
+    return () => {
+      cancelAnimationFrame(animationFrameId);
+      lastAnimationTimeRef.current = null;
+    };
+  }, [viewMode, isReplayPlaying, replaySpeed]);
 
-  const activeStartTime = viewMode === "live" ? startTime : replayStartTime;
   const activePlaybackDelay = viewMode === "live" ? PLAYBACK_DELAY_MS : 0;
-  const playbackTime = Math.max(0, Date.now() - activeStartTime - activePlaybackDelay);
+  const playbackTime =
+    viewMode === "live"
+      ? Math.max(0, Date.now() - startTime - activePlaybackDelay)
+      : Math.max(0, replayElapsedMs);
+  const replayDurationMs = replayMeta
+    ? Math.max(
+        0,
+        new Date(replayMeta.end_ts).getTime() -
+          new Date(replayMeta.start_ts).getTime(),
+      )
+    : 0;
+  const replayProgressPct =
+    replayMeta && replayMeta.total_count && replayMeta.total_count > 0
+      ? Math.min(100, (replayMeta.loaded_count / replayMeta.total_count) * 100)
+      : 0;
+  const replayWindowDirty = replayWindowDraftMinutes !== activeReplayWindowMinutes;
+
+  useEffect(() => {
+    if (viewMode !== "replay" || replayDurationMs <= 0) return;
+    if (replayElapsedMs < replayDurationMs) return;
+
+    if (isReplayPlaying) {
+      setIsReplayPlaying(false);
+    }
+    if (replayElapsedMs !== replayDurationMs) {
+      setReplayElapsedMs(replayDurationMs);
+    }
+  }, [isReplayPlaying, replayDurationMs, replayElapsedMs, viewMode]);
 
   const validVehicles = useMemo(() => {
     return activeVehicles
@@ -303,10 +537,10 @@ export default function App() {
         const lastTime = d.path[d.path.length - 1][2];
         const isStale = playbackTime > lastTime;
 
-        if (isStale) return [80, 80, 80]; // Grey
-        if (d.delay > 180) return [231, 76, 60]; // Red
-        if (d.delay > 60) return [243, 156, 18]; // Orange
-        return [46, 204, 113]; // Green
+        if (isStale) return [80, 80, 80];
+        if (d.delay > 180) return [231, 76, 60];
+        if (d.delay > 60) return [243, 156, 18];
+        return [46, 204, 113];
       },
 
       opacity: 0.6,
@@ -427,21 +661,161 @@ export default function App() {
 
           <div style={{ display: "flex", gap: 8 }}>
             <button
-              onClick={() => setViewMode("live")}
+              onClick={() => {
+                replayLoadIdRef.current += 1;
+                setIsReplayLoading(false);
+                setIsReplayPlaying(false);
+                setReplayElapsedMs(0);
+                lastAnimationTimeRef.current = null;
+                setViewMode("live");
+              }}
               style={{ opacity: viewMode === "live" ? 1 : 0.6 }}
             >
               Live
             </button>
             <button
               onClick={() => loadReplay()}
+              disabled={isReplayLoading}
               style={{ opacity: viewMode === "replay" ? 1 : 0.6 }}
             >
-              Replay
+              {isReplayLoading ? "Loading..." : "Replay"}
             </button>
           </div>
+          <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            Window
+            <select
+              value={replayWindowDraftMinutes}
+              onChange={(event) =>
+                setReplayWindowDraftMinutes(Number(event.target.value))
+              }
+              disabled={isReplayLoading}
+            >
+              {REPLAY_WINDOW_MINUTES.map((minutes) => (
+                <option key={minutes} value={minutes}>
+                  {minutes}m
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            onClick={() => loadReplay()}
+            disabled={isReplayLoading || !replayWindowDirty}
+            style={{ opacity: replayWindowDirty ? 1 : 0.6 }}
+          >
+            Apply
+          </button>
           Mode: {viewMode.charAt(0).toUpperCase()}
           {viewMode.substring(1, viewMode.length)}
         </div>
+
+        {viewMode === "replay" && (
+          <div
+            style={{
+              marginTop: "10px",
+              display: "flex",
+              flexWrap: "wrap",
+              gap: "8px",
+              alignItems: "center",
+            }}
+          >
+            <button onClick={() => setIsReplayPlaying((prev) => !prev)}>
+              {isReplayPlaying ? "Pause" : "Play"}
+            </button>
+            <button
+              onClick={() => {
+                setReplayElapsedMs(0);
+                visualPositionsRef.current = {};
+              }}
+            >
+              Reset
+            </button>
+            <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+              Speed
+              <select
+                value={replaySpeed}
+                onChange={(event) =>
+                  setReplaySpeed(Number(event.target.value))
+                }
+              >
+                <option value={0.5}>0.5x</option>
+                <option value={1}>1x</option>
+                <option value={2}>2x</option>
+                <option value={4}>4x</option>
+              </select>
+            </label>
+          </div>
+        )}
+
+        {viewMode === "replay" && (
+          <div
+            style={{
+              marginTop: "8px",
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: "8px",
+              color: "#cfd8dc",
+            }}
+          >
+            <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+              Mode
+              <select
+                value={replayFilters.mode}
+                onChange={(event) =>
+                  setReplayFilters((prev) => ({
+                    ...prev,
+                    mode: event.target.value as ReplayFilters["mode"],
+                  }))
+                }
+              >
+                {REPLAY_MODES.map((mode) => (
+                  <option key={mode} value={mode}>
+                    {mode}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+              Line
+              <input
+                value={replayFilters.lineQuery}
+                onChange={(event) =>
+                  setReplayFilters((prev) => ({
+                    ...prev,
+                    lineQuery: event.target.value,
+                  }))
+                }
+                placeholder="all"
+                style={{ width: "100%" }}
+              />
+            </label>
+            <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+              <input
+                type="checkbox"
+                checked={replayFilters.includeInterpolated}
+                onChange={(event) =>
+                  setReplayFilters((prev) => ({
+                    ...prev,
+                    includeInterpolated: event.target.checked,
+                  }))
+                }
+              />
+              Include interpolated
+            </label>
+            <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+              <input
+                type="checkbox"
+                checked={replayFilters.hideVehiclesWithLatestInvalidGap}
+                onChange={(event) =>
+                  setReplayFilters((prev) => ({
+                    ...prev,
+                    hideVehiclesWithLatestInvalidGap: event.target.checked,
+                  }))
+                }
+              />
+              Hide latest invalid-gap
+            </label>
+          </div>
+        )}
 
         <div
           style={{
@@ -463,9 +837,49 @@ export default function App() {
               color: "#cfd8dc",
             }}
           >
-            Replay: {replayMeta.returned_count}/{replayMeta.requested_limit} |
-            has_more: {String(replayMeta.has_more)} | db: {replayMeta.query_time_ms}
-            ms
+            Load: {isReplayLoading ? "fetching" : "ready"} | progress:{" "}
+            {replayMeta.total_count ? replayProgressPct.toFixed(1) : "--"}% |
+            window: {activeReplayWindowMinutes}m | Replay: {replayMeta.loaded_count}/
+            {replayMeta.total_count ?? "?"} | has_more: {String(replayMeta.has_more)} |
+            db: {replayMeta.query_time_ms}ms | t:{" "}
+            {(playbackTime / 1000).toFixed(1)}s /{" "}
+            {(replayDurationMs / 1000).toFixed(1)}s | speed: {replaySpeed}x |
+            shown: {replayStats.shownVehicles} | obs: {replayStats.observedPoints}{" "}
+            int: {replayStats.interpolatedPoints} | invalid:{" "}
+            {replayStats.invalidGapPoints}
+          </div>
+        )}
+        {viewMode === "replay" && replayError && (
+          <div
+            style={{
+              marginTop: "8px",
+              borderTop: "1px solid #5c2b2b",
+              paddingTop: "6px",
+              fontSize: "10px",
+              color: "#ffb3b3",
+            }}
+          >
+            Replay error: {replayError}
+          </div>
+        )}
+        {viewMode === "replay" && replayMeta && (
+          <div
+            style={{
+              marginTop: "6px",
+              height: "4px",
+              background: "#222",
+              borderRadius: "999px",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                width: `${replayProgressPct}%`,
+                height: "100%",
+                background: isReplayLoading ? "#3498db" : "#2ecc71",
+                transition: "width 120ms linear",
+              }}
+            />
           </div>
         )}
       </div>
