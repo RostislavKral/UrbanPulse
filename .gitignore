@@ -22,6 +22,9 @@ htmlcov/
 .venv/
 venv/
 
+# Local scratch files
+/2026-??-??
+
 # OS/editor
 .DS_Store
 .idea/

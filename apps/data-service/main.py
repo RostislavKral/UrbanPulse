@@ -24,6 +24,7 @@ from redis.asyncio import Redis
 GOLEMIO_API_URL = "https://api.golemio.cz/v2/vehiclepositions?limit=3000"
 REDIS_CHANNEL = "urban_pulse:updates"
 PUBLISH_INTERVAL_SECONDS = 5
+DEFAULT_DELAY_ALERTS_PATH = "/app/ml/models/delay_increase_alerts.json"
 # GTFS route_type -> human-readable transport mode.
 ROUTE_TYPE_TO_MODE = {
     0: "tram",
@@ -46,8 +47,16 @@ def _load_root_env() -> None:
     Docker Compose.
     """
 
-    env_path = Path(__file__).resolve().parents[2] / ".env"
-    if not env_path.exists():
+    service_path = Path(__file__).resolve()
+    env_candidates = [
+        service_path.parent / ".env",
+        *[
+            parent / ".env"
+            for parent in service_path.parents
+        ],
+    ]
+    env_path = next((path for path in env_candidates if path.exists()), None)
+    if env_path is None:
         return
 
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
@@ -131,8 +140,12 @@ async def fetch_data(client: httpx.AsyncClient) -> dict[str, Any] | None:
 def load_route_type_by_id() -> dict[str, int]:
     """Build a route_id -> route_type mapping from GTFS routes.txt."""
 
+    service_path = Path(__file__).resolve()
     candidates = [
-        Path(__file__).resolve().parents[2] / "db/gtfs/pid_static/routes.txt",
+        *[
+            parent / "db/gtfs/pid_static/routes.txt"
+            for parent in service_path.parents
+        ],
         Path("/app/db/gtfs/pid_static/routes.txt"),
     ]
 
@@ -340,6 +353,89 @@ async def health() -> dict[str, str]:
 
     return {"status": "ok"}
 
+
+def _get_delay_alerts_path() -> Path:
+    return Path(os.getenv("DELAY_ALERTS_PATH", DEFAULT_DELAY_ALERTS_PATH))
+
+
+def _coerce_alert_record(record: Any) -> dict[str, Any] | None:
+    if not isinstance(record, dict):
+        return None
+
+    risk = record.get("delay_increase_risk")
+    try:
+        risk_value = float(risk)
+    except (TypeError, ValueError):
+        risk_value = 0.0
+
+    return {
+        **record,
+        "delay_increase_risk": risk_value,
+        "delay_increase_alert": bool(record.get("delay_increase_alert")),
+    }
+
+
+@app.get("/delay-increase-alerts")
+async def delay_increase_alerts(
+    limit: int = Query(100, ge=1, le=1000),
+    alerts_only: bool = True,
+) -> dict[str, Any]:
+    """Return the latest scored delay-increase risk rows from a JSON artifact."""
+
+    alerts_path = _get_delay_alerts_path()
+    if not alerts_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Delay alert artifact not found: {alerts_path}",
+        )
+
+    try:
+        raw_records = json.loads(alerts_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Delay alert artifact is invalid JSON: {exc}",
+        ) from exc
+
+    if not isinstance(raw_records, list):
+        raise HTTPException(
+            status_code=500,
+            detail="Delay alert artifact must be a JSON array.",
+        )
+
+    records = [
+        record
+        for record in (_coerce_alert_record(raw_record) for raw_record in raw_records)
+        if record is not None
+    ]
+    if alerts_only:
+        records = [
+            record
+            for record in records
+            if record.get("delay_increase_alert")
+        ]
+
+    records.sort(
+        key=lambda record: record.get("delay_increase_risk", 0.0),
+        reverse=True,
+    )
+    page = records[:limit]
+
+    return {
+        "meta": {
+            "artifact_path": str(alerts_path),
+            "artifact_mtime": datetime.fromtimestamp(
+                alerts_path.stat().st_mtime,
+                timezone.utc,
+            ).isoformat(),
+            "total_count": len(records),
+            "returned_count": len(page),
+            "alerts_only": alerts_only,
+        },
+        "data": page,
+    }
+
+
 @app.get("/replay")
 async def replay(
     request: Request,
@@ -448,4 +544,36 @@ async def replay(
             "next_cursor_vehicle_id": next_cursor_vehicle_id,
         },
         "data": data,
+    }
+
+
+@app.get("/replay/bounds")
+async def replay_bounds(request: Request) -> dict[str, Any]:
+    """Return the available timestamp bounds for replay data."""
+
+    db_pool = getattr(request.app.state, "db_pool", None)
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database pool is not initialized")
+
+    query_started = perf_counter()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                min(time) AS min_time,
+                max(time) AS max_time
+            FROM vehicle_trajectory_points
+            """,
+        )
+    elapsed_ms = round((perf_counter() - query_started) * 1000.0, 2)
+
+    min_time = row["min_time"] if row else None
+    max_time = row["max_time"] if row else None
+
+    return {
+        "meta": {
+            "min_time": min_time.isoformat() if min_time else None,
+            "max_time": max_time.isoformat() if max_time else None,
+            "query_time_ms": elapsed_ms,
+        },
     }

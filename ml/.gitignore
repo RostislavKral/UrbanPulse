@@ -1,0 +1,25 @@
+# Local data and training outputs. Keep scripts/docs in git, regenerate artifacts locally.
+data/raw/
+data/processed/
+models/
+
+# Exported source chunks and archives can be many GB.
+vehicle_positions_*.csv.gz
+vehicle_positions_all_chunks.tar.gz
+*.tar.gz
+
+# Generated datasets, scored outputs, and logs.
+*.parquet
+*.csv
+*.csv.gz
+*.joblib
+*.json
+*.log
+
+# Local Python state.
+.venv/
+__pycache__/
+*/__pycache__/
+
+# Local machine-specific fetch helper.
+/scripts/fetch_vehicle_exports.sh

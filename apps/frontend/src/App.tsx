@@ -2,7 +2,14 @@ import { TripsLayer } from "@deck.gl/geo-layers";
 import { ScatterplotLayer } from "@deck.gl/layers";
 import { DeckGL, PickingInfo } from "deck.gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { startTransition, useEffect, useMemo, useRef, useState } from "react";
+import {
+  startTransition,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import MapView from "react-map-gl/maplibre";
 import { useLiveVehicles } from "./hooks/useLiveVehicles";
 import { RenderedVehicle, Vehicle, VehicleMode } from "./types/vehicle";
@@ -27,12 +34,24 @@ const PLAYBACK_DELAY_MS = 30000;
 const TRAIL_LENGTH_MS = 150000;
 const DROP_THRESHOLD_MS = 5 * 60 * 1000;
 const SMOOTHING_FACTOR = 0.1;
+const PRAGUE_BOUNDS = {
+  minLon: 14.2,
+  maxLon: 14.75,
+  minLat: 49.9,
+  maxLat: 50.2,
+};
 
 const lerp = (start: number, end: number, factor: number): number =>
   start + (end - start) * factor;
 
 const isValidPoint = (point: unknown): point is [number, number, number] =>
   Array.isArray(point) && point.length >= 3;
+
+const isWithinPragueBounds = (lon: number, lat: number): boolean =>
+  lat >= PRAGUE_BOUNDS.minLat &&
+  lat <= PRAGUE_BOUNDS.maxLat &&
+  lon >= PRAGUE_BOUNDS.minLon &&
+  lon <= PRAGUE_BOUNDS.maxLon;
 
 interface TargetPositionResult {
   pos: [number, number];
@@ -53,6 +72,14 @@ type ReplayMeta = {
   query_time_ms: number;
   next_cursor_time: string | null;
   next_cursor_vehicle_id: string | null;
+};
+type ReplayBoundsMeta = {
+  min_time: string | null;
+  max_time: string | null;
+  query_time_ms: number;
+};
+type ReplayBoundsResponse = {
+  meta: ReplayBoundsMeta;
 };
 type ReplayPointState = "observed" | "interpolated" | "invalid_gap";
 type ReplayConfidence = "high" | "medium" | "low";
@@ -81,6 +108,31 @@ type ReplayStats = {
   invalidGapPoints: number;
   shownVehicles: number;
 };
+type DelayAlertMeta = {
+  artifact_path: string;
+  artifact_mtime: string;
+  total_count: number;
+  returned_count: number;
+  alerts_only: boolean;
+};
+type DelayAlertRecord = {
+  vehicle_id: string;
+  time: string;
+  delay: number | null;
+  speed: number | null;
+  line: string | null;
+  route_id: string | null;
+  state_position: string | null;
+  target_delay_delta: number | null;
+  delay_increase_risk: number;
+  delay_increase_alert: boolean;
+  actual_increase_60s?: number | null;
+};
+type DelayAlertsResponse = {
+  meta: DelayAlertMeta;
+  data: DelayAlertRecord[];
+};
+type RiskListFilter = "all" | "on_map";
 
 const REPLAY_MODES: Array<VehicleMode | "all"> = [
   "all",
@@ -101,6 +153,29 @@ const DEFAULT_REPLAY_FILTERS: ReplayFilters = {
 const REPLAY_WINDOW_MINUTES = [1, 5, 15, 30];
 const REPLAY_PAGE_SIZE = 5000;
 const REPLAY_REFRESH_DEBOUNCE_MS = 150;
+const DELAY_ALERT_LIMIT = 12;
+const DELAY_ALERT_REFRESH_MS = 60_000;
+
+function formatPercent(value: number): string {
+  return `${Math.round(value * 100)}%`;
+}
+
+function formatSeconds(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "--";
+  const sign = value > 0 ? "+" : "";
+  if (Math.abs(value) < 60) return `${sign}${Math.round(value)}s`;
+  return `${sign}${(value / 60).toFixed(1)}m`;
+}
+
+function formatAlertTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "--";
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(date);
+}
 
 function appendReplayRows(
   grouped: Map<string, ReplayRow[]>,
@@ -133,7 +208,12 @@ function buildReplayVehicles(
   for (const [vehicleId, vehicleRows] of grouped.entries()) {
     if (vehicleRows.length < 1) continue;
 
-    const last = vehicleRows[vehicleRows.length - 1];
+    const boundedRows = vehicleRows.filter((row) =>
+      isWithinPragueBounds(row.lon, row.lat),
+    );
+    if (boundedRows.length < 1) continue;
+
+    const last = boundedRows[boundedRows.length - 1];
     const mode = (last.mode ?? "unknown") as VehicleMode;
     const line = last.route_id ?? "unknown";
     const latestPointIsInvalidGap = last.point_state === "invalid_gap";
@@ -151,7 +231,7 @@ function buildReplayVehicles(
 
     const path: Array<[number, number, number]> = [];
 
-    for (const row of vehicleRows) {
+    for (const row of boundedRows) {
       if (row.point_state === "invalid_gap") {
         stats.invalidGapPoints += 1;
         continue;
@@ -252,6 +332,14 @@ export default function App() {
     invalidGapPoints: 0,
     shownVehicles: 0,
   });
+  const [delayAlerts, setDelayAlerts] = useState<DelayAlertRecord[]>([]);
+  const [delayAlertMeta, setDelayAlertMeta] = useState<DelayAlertMeta | null>(
+    null,
+  );
+  const [isDelayAlertsLoading, setIsDelayAlertsLoading] = useState(false);
+  const [delayAlertsError, setDelayAlertsError] = useState<string | null>(null);
+  const [isRiskPanelOpen, setIsRiskPanelOpen] = useState(true);
+  const [riskListFilter, setRiskListFilter] = useState<RiskListFilter>("all");
   const replayLoadIdRef = useRef(0);
   const replayFiltersRef = useRef<ReplayFilters>(DEFAULT_REPLAY_FILTERS);
   const replayRowsRef = useRef<Map<string, ReplayRow[]>>(new Map());
@@ -260,6 +348,49 @@ export default function App() {
   const replayRefreshTimerRef = useRef<number | null>(null);
 
   const activeVehicles = viewMode === "live" ? vehicles : replayVehicles;
+  const activeVehicleIds = useMemo(() => {
+    return new Set(activeVehicles.map((vehicle) => vehicle.id));
+  }, [activeVehicles]);
+  const delayAlertByVehicle = useMemo(() => {
+    return new Map(delayAlerts.map((alert) => [alert.vehicle_id, alert]));
+  }, [delayAlerts]);
+  const onMapDelayAlertCount = useMemo(() => {
+    return delayAlerts.filter((alert) => activeVehicleIds.has(alert.vehicle_id))
+      .length;
+  }, [activeVehicleIds, delayAlerts]);
+  const visibleDelayAlerts = useMemo(() => {
+    if (riskListFilter === "on_map") {
+      return delayAlerts.filter((alert) => activeVehicleIds.has(alert.vehicle_id));
+    }
+    return delayAlerts;
+  }, [activeVehicleIds, delayAlerts, riskListFilter]);
+  const topDelayAlert = delayAlerts[0] ?? null;
+  const loadDelayAlerts = useCallback(async () => {
+    setIsDelayAlertsLoading(true);
+    setDelayAlertsError(null);
+
+    try {
+      const params = new URLSearchParams({
+        limit: String(DELAY_ALERT_LIMIT),
+      });
+      const response = await fetch(
+        `${API_URL}/delay-increase-alerts?${params.toString()}`,
+      );
+      if (!response.ok) {
+        throw new Error(`Delay alert fetch failed: ${response.status}`);
+      }
+
+      const payload = (await response.json()) as DelayAlertsResponse;
+      setDelayAlerts(payload.data);
+      setDelayAlertMeta(payload.meta);
+    } catch (error) {
+      setDelayAlertsError(
+        error instanceof Error ? error.message : "Delay alert loading failed",
+      );
+    } finally {
+      setIsDelayAlertsLoading(false);
+    }
+  }, []);
   const rebuildReplayVehicles = (
     filters: ReplayFilters,
     resetVisuals: boolean = false,
@@ -290,10 +421,6 @@ export default function App() {
 
   const loadReplay = async () => {
     const limit = REPLAY_PAGE_SIZE;
-    const end = Date.now();
-    const start = end - replayWindowDraftMinutes * 60 * 1000;
-    const endIso = new Date(end).toISOString();
-    const startIso = new Date(start).toISOString();
     const loadId = replayLoadIdRef.current + 1;
     replayLoadIdRef.current = loadId;
     let loadedCount = 0;
@@ -306,7 +433,6 @@ export default function App() {
       replayRefreshTimerRef.current = null;
     }
     replayRowsRef.current = new Map();
-    replayStartMsRef.current = start;
     setReplayVehicles([]);
     setReplayMeta(null);
     setIsReplayLoading(true);
@@ -327,6 +453,26 @@ export default function App() {
     visualPositionsRef.current = {};
 
     try {
+      const boundsResponse = await fetch(`${API_URL}/replay/bounds`);
+      if (!boundsResponse.ok) {
+        throw new Error(`Replay bounds fetch failed: ${boundsResponse.status}`);
+      }
+
+      const bounds = (await boundsResponse.json()) as ReplayBoundsResponse;
+      if (!bounds.meta.max_time) {
+        throw new Error("Replay data is empty");
+      }
+
+      const end = new Date(bounds.meta.max_time).getTime();
+      if (!Number.isFinite(end)) {
+        throw new Error("Replay bounds returned an invalid max_time");
+      }
+
+      const start = end - replayWindowDraftMinutes * 60 * 1000;
+      const endIso = new Date(end).toISOString();
+      const startIso = new Date(start).toISOString();
+      replayStartMsRef.current = start;
+
       while (true) {
         const params = new URLSearchParams({
           start_ts: startIso,
@@ -405,6 +551,18 @@ export default function App() {
 
     rebuildReplayVehicles(replayFilters, true);
   }, [replayFilters, viewMode]);
+
+  useEffect(() => {
+    loadDelayAlerts();
+    const intervalId = window.setInterval(
+      loadDelayAlerts,
+      DELAY_ALERT_REFRESH_MS,
+    );
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [loadDelayAlerts]);
 
   useEffect(() => {
     return () => {
@@ -538,6 +696,7 @@ export default function App() {
         const isStale = playbackTime > lastTime;
 
         if (isStale) return [80, 80, 80];
+        if (delayAlertByVehicle.has(d.id)) return [255, 82, 82];
         if (d.delay > 180) return [231, 76, 60];
         if (d.delay > 60) return [243, 156, 18];
         return [46, 204, 113];
@@ -563,10 +722,14 @@ export default function App() {
 
       stroked: true,
       getLineWidth: 2,
-      getFillColor: [255, 255, 255, 255],
+      getFillColor: (d: RenderedVehicle) =>
+        delayAlertByVehicle.has(d.id)
+          ? [255, 82, 82, 255]
+          : [255, 255, 255, 255],
       pickable: true,
 
       getLineColor: (d: RenderedVehicle) => {
+        if (delayAlertByVehicle.has(d.id)) return [255, 213, 79];
         if (d.delay < 60) return [46, 204, 113];
         if (d.delay < 180) return [243, 156, 18];
         return [231, 76, 60];
@@ -575,8 +738,8 @@ export default function App() {
       parameters: { depthTest: false },
 
       updateTriggers: {
-        getFillColor: [playbackTime],
-        getLineColor: [playbackTime],
+        getFillColor: [delayAlerts],
+        getLineColor: [playbackTime, delayAlerts],
       },
     }),
   ];
@@ -884,6 +1047,146 @@ export default function App() {
         )}
       </div>
 
+      <div
+        className={`risk-panel ${isRiskPanelOpen ? "" : "risk-panel--collapsed"}`}
+      >
+        <div className="risk-panel__header">
+          <div className="risk-panel__title">
+            <div
+              className={`risk-panel__dot ${
+                delayAlertsError ? "risk-panel__dot--error" : ""
+              }`}
+            />
+            <div>
+              <div className="risk-panel__eyebrow">HIGH CONFIDENCE</div>
+              <div className="risk-panel__heading">Delay Increase Risk</div>
+            </div>
+          </div>
+          <div className="risk-panel__actions">
+            <button
+              className="risk-panel__button"
+              onClick={() => loadDelayAlerts()}
+              disabled={isDelayAlertsLoading}
+              title="Refresh alerts"
+            >
+              {isDelayAlertsLoading ? "..." : "Refresh"}
+            </button>
+            <button
+              className="risk-panel__button"
+              onClick={() => setIsRiskPanelOpen((prev) => !prev)}
+              title={isRiskPanelOpen ? "Collapse alerts" : "Expand alerts"}
+            >
+              {isRiskPanelOpen ? "-" : "+"}
+            </button>
+          </div>
+        </div>
+
+        {isRiskPanelOpen && (
+          <div className="risk-panel__body">
+            <div className="risk-panel__summary">
+              <div className="risk-panel__metric">
+                <div className="risk-panel__metric-label">Alerts</div>
+                <div className="risk-panel__metric-value">
+                  {delayAlertMeta?.total_count ?? delayAlerts.length}
+                </div>
+              </div>
+              <div className="risk-panel__metric">
+                <div className="risk-panel__metric-label">On Map</div>
+                <div className="risk-panel__metric-value">
+                  {onMapDelayAlertCount}
+                </div>
+              </div>
+              <div className="risk-panel__metric">
+                <div className="risk-panel__metric-label">Top Risk</div>
+                <div className="risk-panel__metric-value">
+                  {topDelayAlert
+                    ? formatPercent(topDelayAlert.delay_increase_risk)
+                    : "--"}
+                </div>
+              </div>
+            </div>
+
+            <div className="risk-panel__filters">
+              <button
+                className={`risk-panel__filter ${
+                  riskListFilter === "all" ? "risk-panel__filter--active" : ""
+                }`}
+                onClick={() => setRiskListFilter("all")}
+              >
+                All Alerts
+              </button>
+              <button
+                className={`risk-panel__filter ${
+                  riskListFilter === "on_map"
+                    ? "risk-panel__filter--active"
+                    : ""
+                }`}
+                onClick={() => setRiskListFilter("on_map")}
+              >
+                On Map ({onMapDelayAlertCount})
+              </button>
+            </div>
+
+            {delayAlertsError && (
+              <div className="risk-panel__status risk-panel__status--error">
+                {delayAlertsError}
+              </div>
+            )}
+
+            {!delayAlertsError && visibleDelayAlerts.length === 0 && (
+              <div className="risk-panel__status">
+                No high-confidence alerts in this view.
+              </div>
+            )}
+
+            {!delayAlertsError && visibleDelayAlerts.length > 0 && (
+              <div className="risk-panel__list">
+                {visibleDelayAlerts.map((alert) => (
+                  <div
+                    className="risk-alert"
+                    key={`${alert.vehicle_id}-${alert.time}`}
+                  >
+                    <div className="risk-alert__score">
+                      {formatPercent(alert.delay_increase_risk)}
+                    </div>
+                    <div className="risk-alert__main">
+                      <div className="risk-alert__topline">
+                        <div className="risk-alert__name">
+                          {alert.line ?? alert.route_id ?? "unknown"} /{" "}
+                          {alert.vehicle_id}
+                        </div>
+                        <div className="risk-alert__time">
+                          {formatAlertTime(alert.time)}
+                        </div>
+                      </div>
+                      <div className="risk-alert__meta">
+                        {alert.state_position ?? "unknown"} | route{" "}
+                        {alert.route_id ?? "--"}
+                      </div>
+                      <div className="risk-alert__chips">
+                        <span className="risk-alert__chip risk-alert__chip--hot">
+                          delta {formatSeconds(alert.target_delay_delta)}
+                        </span>
+                        <span className="risk-alert__chip">
+                          delay {formatSeconds(alert.delay)}
+                        </span>
+                        <span className="risk-alert__chip">
+                          speed{" "}
+                          {typeof alert.speed === "number" &&
+                          Number.isFinite(alert.speed)
+                            ? Math.round(alert.speed)
+                            : "--"}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
       <DeckGL
         initialViewState={INITIAL_VIEW_STATE}
         controller={true}
@@ -896,11 +1199,21 @@ export default function App() {
             viewMode === "live" ? Date.now() - startTime : playbackTime;
           const lastTimestamp = vehicle.path[vehicle.path.length - 1][2];
           const secondsAgo = (realNow - lastTimestamp) / 1000;
+          const delayAlert = delayAlertByVehicle.get(vehicle.id);
+          const delayAlertHtml = delayAlert
+            ? `
+                <span style="color: #ffb3b3">
+                  Risk: ${formatPercent(delayAlert.delay_increase_risk)}
+                  (${formatSeconds(delayAlert.target_delay_delta)})
+                </span><br/>
+              `
+            : "";
 
           return {
             html: `
               <div style="font-family: sans-serif; font-size: 12px; padding: 4px; color: #fff; background: #000;">
                 <strong style="font-size: 14px">Line ${vehicle.line}</strong><br/>
+                ${delayAlertHtml}
                 <span style="color: ${vehicle.delay > 180 ? "#e74c3c" : "#2ecc71"}">
                   ${vehicle.delay > 0 ? `+${Math.round(vehicle.delay / 60)} min` : "On time"}
                 </span><br/>

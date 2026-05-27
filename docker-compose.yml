@@ -68,6 +68,9 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-admin}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-}
       - POSTGRES_DB=${POSTGRES_DB:-prague_transport}
+      - DELAY_ALERTS_PATH=/app/ml/models/delay_increase_alerts.json
+    volumes:
+      - ./ml/models:/app/ml/models:ro
     networks:
       - urban-pulse
 

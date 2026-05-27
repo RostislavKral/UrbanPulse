@@ -4,7 +4,7 @@ UrbanPulse is a small, work-in-progress project for collecting and exploring Pra
 
 The system collects vehicle positions from Golemio, stores them in PostgreSQL/TimescaleDB, publishes live updates through Redis/WebSocket, and renders vehicles on a React map. It also includes replay tooling so past traffic can be inspected instead of only watching the live feed.
 
-The ML part is still early and intentionally modest. So far, the focus has been on exporting real collected data, preparing delay-prediction datasets, and comparing simple baselines before trying more complex graph-based models.
+So far, the focus has been on exporting real collected data, preparing delay-prediction datasets, and comparing simple baselines before trying more complex graph-based models.
 
 ## Current Focus
 
@@ -22,4 +22,4 @@ The ML part is still early and intentionally modest. So far, the focus has been 
 - React, Deck.gl, MapLibre
 - Polars and scikit-learn for early ML experiments
 
-This is not a finished product. It is an engineering playground for learning how real-time transport data behaves, where the data quality problems are, and what needs to be true before more advanced ML approaches are worth using.
+Still under construction. It is a playground for learning how real-time transport data behaves, where the data quality problems are, and what needs to be true before more advanced ML approaches are worth using.
