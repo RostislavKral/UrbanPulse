@@ -6,7 +6,6 @@ from pathlib import Path
 
 import polars as pl
 
-
 SCRIPT_PATH = Path(__file__).resolve()
 ML_ROOT = SCRIPT_PATH.parents[1]
 REPO_ROOT = SCRIPT_PATH.parents[2]

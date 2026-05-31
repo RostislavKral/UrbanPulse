@@ -7,9 +7,9 @@ publishes normalized updates to Redis for downstream consumers.
 import json
 import logging
 import os
-from csv import DictReader
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from csv import DictReader
+from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -17,7 +17,7 @@ from typing import Any
 import asyncpg
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, Request, Query, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import Redis
 
@@ -308,7 +308,7 @@ async def publish_updates() -> None:
                 "next_stop_sequence": next_stop.get("sequence"),
                 "next_stop_arrival_time": next_stop.get("arrival_time"),
                 "next_stop_departure_time": next_stop.get("departure_time"),
-                "ingest_ts": datetime.now(timezone.utc).isoformat(),
+                "ingest_ts": datetime.now(UTC).isoformat(),
             }
 
             payload["observation_ts"] = payload.get("origin_timestamp") or payload["ingest_ts"]
@@ -426,7 +426,7 @@ async def delay_increase_alerts(
             "artifact_path": str(alerts_path),
             "artifact_mtime": datetime.fromtimestamp(
                 alerts_path.stat().st_mtime,
-                timezone.utc,
+                UTC,
             ).isoformat(),
             "total_count": len(records),
             "returned_count": len(page),

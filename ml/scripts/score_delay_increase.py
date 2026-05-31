@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import json
 from glob import glob
 from pathlib import Path
 
 import joblib
 import polars as pl
-
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]

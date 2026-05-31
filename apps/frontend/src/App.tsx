@@ -13,6 +13,7 @@ import {
 import MapView from "react-map-gl/maplibre";
 import { useLiveVehicles } from "./hooks/useLiveVehicles";
 import { RenderedVehicle, Vehicle, VehicleMode } from "./types/vehicle";
+import { isWithinPragueBounds } from "./utils/geo";
 
 const WS_URL =
   import.meta.env.VITE_WS_URL?.toString() ?? "ws://127.0.0.1:3000/ws";
@@ -34,24 +35,11 @@ const PLAYBACK_DELAY_MS = 30000;
 const TRAIL_LENGTH_MS = 150000;
 const DROP_THRESHOLD_MS = 5 * 60 * 1000;
 const SMOOTHING_FACTOR = 0.1;
-const PRAGUE_BOUNDS = {
-  minLon: 14.2,
-  maxLon: 14.75,
-  minLat: 49.9,
-  maxLat: 50.2,
-};
-
 const lerp = (start: number, end: number, factor: number): number =>
   start + (end - start) * factor;
 
 const isValidPoint = (point: unknown): point is [number, number, number] =>
   Array.isArray(point) && point.length >= 3;
-
-const isWithinPragueBounds = (lon: number, lat: number): boolean =>
-  lat >= PRAGUE_BOUNDS.minLat &&
-  lat <= PRAGUE_BOUNDS.maxLat &&
-  lon >= PRAGUE_BOUNDS.minLon &&
-  lon <= PRAGUE_BOUNDS.maxLon;
 
 interface TargetPositionResult {
   pos: [number, number];
@@ -681,6 +669,8 @@ export default function App() {
         } as RenderedVehicle;
       })
       .filter((v): v is RenderedVehicle => v !== null);
+    // frameTick intentionally refreshes smoothed positions between data updates.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [validVehicles, playbackTime, frameTick]);
 
   const layers = [

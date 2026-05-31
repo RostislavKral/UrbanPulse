@@ -14,9 +14,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
-from sklearn.preprocessing import StandardScaler
-
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
@@ -496,8 +494,6 @@ def main() -> None:
 
     target_column = "target_delay_delta" if args.target == "delta" else "target_delay"
     y_train = train_df[target_column].to_numpy()
-    y_val = val_df[target_column].to_numpy()
-    y_test = test_df[target_column].to_numpy()
 
     y_val_delay = val_df["target_delay"].to_numpy()
     y_test_delay = test_df["target_delay"].to_numpy()

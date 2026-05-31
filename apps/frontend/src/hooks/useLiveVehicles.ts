@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Vehicle } from "../types/vehicle";
+import { distanceMeters, isWithinPragueBounds } from "../utils/geo";
 
 const MAX_PATH_POINTS = 30;
 
@@ -8,30 +9,6 @@ const MAX_JUMP_METERS = 1500;
 const MAX_SPEED_MPS = 40;
 
 const STALE_VEHICLE_TTL_MS = 2 * 60 * 1000;
-
-const PRAGUE_BOUNDS = {
-  minLon: 14.2,
-  maxLon: 14.75,
-  minLat: 49.9,
-  maxLat: 50.2,
-};
-
-const toRadians = (value: number): number => (value * Math.PI) / 180;
-
-const distanceMeters = (a: [number, number], b: [number, number]): number => {
-  const R = 6371000; // Earth radius in meters
-  const lat1 = toRadians(a[1]);
-  const lat2 = toRadians(b[1]);
-  const deltaLat = toRadians(b[1] - a[1]);
-  const deltaLon = toRadians(b[0] - a[0]);
-
-  const sinLat = Math.sin(deltaLat / 2);
-  const sinLon = Math.sin(deltaLon / 2);
-
-  const h = sinLat * sinLat + Math.cos(lat1) * Math.cos(lat2) * sinLon * sinLon;
-
-  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
-};
 
 interface UseLiveVehiclesResult {
   vehicles: Vehicle[];
@@ -102,12 +79,7 @@ export function useLiveVehicles(
           return;
         }
 
-        if (
-          lat < PRAGUE_BOUNDS.minLat ||
-          lat > PRAGUE_BOUNDS.maxLat ||
-          lon < PRAGUE_BOUNDS.minLon ||
-          lon > PRAGUE_BOUNDS.maxLon
-        ) {
+        if (!isWithinPragueBounds(lon, lat)) {
           return;
         }
 

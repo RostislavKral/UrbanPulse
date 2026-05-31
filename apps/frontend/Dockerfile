@@ -2,8 +2,8 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-COPY package.json /app/package.json
-RUN npm install
+COPY package.json package-lock.json /app/
+RUN npm ci
 
 COPY tsconfig.json /app/tsconfig.json
 COPY tsconfig.node.json /app/tsconfig.node.json

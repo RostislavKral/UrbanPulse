@@ -10,7 +10,7 @@ import logging
 import math
 import os
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -546,7 +546,7 @@ async def main() -> None:
                     vehicle_id = str(payload["id"])
 
                     cur_t = _to_optional_timestamp(payload.get("observation_ts")) or datetime.now(
-                        timezone.utc
+                        UTC
                     )
                     cur_lat = float(payload["lat"])
                     cur_lon = float(payload["lon"])
@@ -560,7 +560,7 @@ async def main() -> None:
                     try:
                         buffer.append(
                             (
-                                datetime.now(timezone.utc),
+                                datetime.now(UTC),
                                 str(payload["id"]),
                                 str(payload.get("line", "")),
                                 _to_int(payload.get("delay", 0), default=0),

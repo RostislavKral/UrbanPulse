@@ -25,6 +25,9 @@ venv/
 # Local scratch files
 /2026-??-??
 
+# Local Kubernetes secrets.
+/deploy/kubernetes/secret.yaml
+
 # OS/editor
 .DS_Store
 .idea/

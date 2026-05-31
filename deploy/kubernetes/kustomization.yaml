@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: urbanpulse
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - db-init-configmap.yaml
+  - redis.yaml
+  - timescaledb.yaml
+  - data-service.yaml
+  - realtime-gateway.yaml
+  - frontend.yaml
+
+images:
+  - name: urbanpulse/frontend
+    newName: ghcr.io/your-github-owner/urbanpulse/frontend
+    newTag: latest
+  - name: urbanpulse/realtime-gateway
+    newName: ghcr.io/your-github-owner/urbanpulse/realtime-gateway
+    newTag: latest
+  - name: urbanpulse/data-service
+    newName: ghcr.io/your-github-owner/urbanpulse/data-service
+    newTag: latest

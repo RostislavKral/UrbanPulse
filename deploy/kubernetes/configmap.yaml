@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: urbanpulse-config
+data:
+  POSTGRES_USER: admin
+  POSTGRES_DB: prague_transport
+  POSTGRES_HOST: timescaledb
+  POSTGRES_PORT: "5432"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  PORT: "3000"
+  VITE_WS_URL: ws://127.0.0.1:3000/ws
+  DELAY_ALERTS_PATH: /app/ml/models/delay_increase_alerts.json

@@ -36,6 +36,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Audit dependencies
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
       - name: Build
         run: npm run build
 
@@ -59,11 +69,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Audit dependencies
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
       - name: Build
         run: npm run build
 
   python:
-    name: Python syntax check
+    name: Python
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -78,8 +98,18 @@ jobs:
             apps/data-service/requirements.txt
             ml/requirements.txt
 
-      - name: Install data service dependencies
-        run: python -m pip install -r apps/data-service/requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Audit dependencies
+        continue-on-error: true
+        run: python -m pip_audit -r apps/data-service/requirements.txt
+
+      - name: Lint
+        run: python -m ruff check apps/data-service ml/scripts tests/python
+
+      - name: Test
+        run: python -m pytest
 
       - name: Check Python syntax
         run: python -m py_compile apps/data-service/*.py ml/scripts/*.py
@@ -92,6 +122,7 @@ jobs:
       - realtime-gateway
       - python
     env:
+      COMPOSE_PROJECT_NAME: urbanpulse
       GOLEMIO_API_KEY: dummy
       POSTGRES_PASSWORD: dummy
       PGADMIN_DEFAULT_PASSWORD: dummy
@@ -105,5 +136,50 @@ jobs:
       - name: Validate Compose config
         run: docker compose config --quiet
 
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+
       - name: Build service images
         run: docker compose build frontend realtime-gateway data-api
+
+      - name: Trivy frontend image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          image-ref: urbanpulse-frontend:latest
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+
+      - name: Trivy realtime gateway image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          image-ref: urbanpulse-realtime-gateway:latest
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+
+      - name: Trivy data service image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          image-ref: urbanpulse-data-api:latest
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
