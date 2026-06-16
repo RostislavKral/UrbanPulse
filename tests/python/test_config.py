@@ -1,3 +1,4 @@
+import db_migrations
 import logger
 import main
 import pytest
@@ -47,11 +48,11 @@ def test_get_db_url_reports_missing_environment(
         logger.get_db_url()
 
 
-def test_logger_env_parsers_fall_back_on_invalid_values(
+def test_migration_env_parsers_fall_back_on_invalid_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("POSITIONS_RETENTION_DAYS", "not-an-int")
     monkeypatch.setenv("ENABLE_TRAJECTORY_HYPERTABLE_MIGRATION", "yes")
 
-    assert logger._get_int_env("POSITIONS_RETENTION_DAYS", 35) == 35
-    assert logger._get_bool_env("ENABLE_TRAJECTORY_HYPERTABLE_MIGRATION") is True
+    assert db_migrations.get_int_env("POSITIONS_RETENTION_DAYS", 35) == 35
+    assert db_migrations.get_bool_env("ENABLE_TRAJECTORY_HYPERTABLE_MIGRATION") is True

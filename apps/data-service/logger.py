@@ -16,6 +16,7 @@ from typing import Any
 
 import asyncpg
 import redis.asyncio as redis
+from db_migrations import run_migrations
 
 INTERP_MIN_SECONDS = 2
 INTERP_MAX_SECONDS = 30
@@ -78,53 +79,6 @@ def _load_root_env() -> None:
 _load_root_env()
 
 
-def _get_int_env(name: str, default: int) -> int:
-    """Read an integer env var and fall back to a default on invalid input."""
-
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("Invalid integer for %s=%r; using default %d", name, raw, default)
-        return default
-
-
-def _get_bool_env(name: str, default: bool = False) -> bool:
-    """Read a boolean env var from common truthy values."""
-
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-async def _is_hypertable(conn: asyncpg.Connection, table_name: str) -> bool:
-    """Return whether a table is already managed by TimescaleDB."""
-
-    return bool(
-        await conn.fetchval(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                FROM timescaledb_information.hypertables
-                WHERE hypertable_name = $1
-            )
-            """,
-            table_name,
-        )
-    )
-
-
-async def _table_has_rows(conn: asyncpg.Connection, table_name: str) -> bool:
-    """Cheap existence check for trusted internal table names."""
-
-    return bool(await conn.fetchval(f"SELECT EXISTS (SELECT 1 FROM {table_name} LIMIT 1)"))
-
-
 def get_db_url() -> str:
     """Return a Postgres connection URL from environment variables.
 
@@ -157,182 +111,9 @@ def get_db_url() -> str:
 
 
 async def init_db(pool: asyncpg.Pool) -> None:
-    """Create required tables and indices, and convert to a hypertable if available."""
+    """Apply database migrations and idempotent TimescaleDB setup."""
 
-    positions_retention_days = _get_int_env("POSITIONS_RETENTION_DAYS", 35)
-    trajectory_retention_days = _get_int_env("TRAJECTORY_RETENTION_DAYS", 14)
-    positions_compress_after_days = _get_int_env("POSITIONS_COMPRESS_AFTER_DAYS", 2)
-    trajectory_compress_after_days = _get_int_env("TRAJECTORY_COMPRESS_AFTER_DAYS", 2)
-    enable_traj_hypertable_migration = _get_bool_env(
-        "ENABLE_TRAJECTORY_HYPERTABLE_MIGRATION",
-        False,
-    )
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS vehicle_positions (
-                time                      TIMESTAMPTZ       NOT NULL,
-                vehicle_id                TEXT              NOT NULL,
-                lat                       DOUBLE PRECISION  NOT NULL,
-                lon                       DOUBLE PRECISION  NOT NULL,
-                line                      TEXT,
-                delay                     INTEGER,
-                speed                     INTEGER,
-                route_id                  TEXT,
-                mode                      TEXT,
-                route_type                INTEGER,
-                trip_id                   TEXT,
-                state_position            TEXT,
-                origin_timestamp          TIMESTAMPTZ,
-                last_stop_id              TEXT,
-                last_stop_sequence        INTEGER,
-                last_stop_arrival_time    TIMESTAMPTZ,
-                last_stop_departure_time  TIMESTAMPTZ,
-                next_stop_id              TEXT,
-                next_stop_sequence        INTEGER,
-                next_stop_arrival_time    TIMESTAMPTZ,
-                next_stop_departure_time  TIMESTAMPTZ
-            );
-
-            CREATE TABLE IF NOT EXISTS vehicle_trajectory_points (
-            time TIMESTAMPTZ NOT NULL,
-            vehicle_id TEXT NOT NULL,
-            lat DOUBLE PRECISION NOT NULL,
-            lon DOUBLE PRECISION NOT NULL,
-            point_state TEXT NOT NULL,            -- observed|interpolated|invalid_gap
-            confidence TEXT NOT NULL,             -- high|medium|low
-            interpolation_method TEXT,            -- linear|speed_constrained|null
-            gap_reason TEXT,                      -- speed_violation|dropout|out_of_order|null
-            route_id TEXT,
-            trip_id TEXT,
-            mode TEXT
-            );
-        """
-        )
-
-        # Keep existing local databases compatible when new telemetry fields are added.
-        alter_statements = [
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS route_id TEXT;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS trip_id TEXT;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS mode TEXT;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS route_type INTEGER;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS state_position TEXT;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS origin_timestamp TIMESTAMPTZ;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS last_stop_id TEXT;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS last_stop_sequence INTEGER;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS last_stop_arrival_time TIMESTAMPTZ;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS last_stop_departure_time TIMESTAMPTZ;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS next_stop_id TEXT;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS next_stop_sequence INTEGER;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS next_stop_arrival_time TIMESTAMPTZ;",
-            "ALTER TABLE vehicle_positions ADD COLUMN IF NOT EXISTS next_stop_departure_time TIMESTAMPTZ;",
-        ]
-        for statement in alter_statements:
-            await conn.execute(statement)
-
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_vehicle_id ON vehicle_positions (vehicle_id, time DESC);"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_traj_vehicle_time ON vehicle_trajectory_points (vehicle_id, time DESC);"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_traj_time_vehicle ON vehicle_trajectory_points (time ASC, vehicle_id ASC);"
-        )
-
-        try:
-            await conn.execute(
-                """
-                SELECT create_hypertable(
-                    'vehicle_positions',
-                    'time',
-                    chunk_time_interval => INTERVAL '1 day',
-                    if_not_exists => TRUE,
-                    migrate_data => TRUE
-                );
-                """
-            )
-            await conn.execute(
-                """
-                ALTER TABLE vehicle_positions SET (
-                    timescaledb.compress,
-                    timescaledb.compress_segmentby = 'vehicle_id',
-                    timescaledb.compress_orderby = 'time DESC'
-                );
-                """
-            )
-            await conn.execute(
-                "SELECT add_compression_policy('vehicle_positions', $1::interval, if_not_exists => TRUE);",
-                f"{positions_compress_after_days} days",
-            )
-            await conn.execute(
-                "SELECT add_retention_policy('vehicle_positions', $1::interval, if_not_exists => TRUE);",
-                f"{positions_retention_days} days",
-            )
-            logger.info(
-                "vehicle_positions hypertable is ready with compression after %s days and retention after %s days.",
-                positions_compress_after_days,
-                positions_retention_days,
-            )
-        except Exception:
-            logger.info("TimescaleDB extension not available; using a standard table.")
-
-        try:
-            trajectory_is_hypertable = await _is_hypertable(
-                conn,
-                "vehicle_trajectory_points",
-            )
-            if not trajectory_is_hypertable:
-                trajectory_has_rows = await _table_has_rows(
-                    conn,
-                    "vehicle_trajectory_points",
-                )
-                if trajectory_has_rows and not enable_traj_hypertable_migration:
-                    logger.warning(
-                        "vehicle_trajectory_points is still a plain table with existing data. "
-                        "Set ENABLE_TRAJECTORY_HYPERTABLE_MIGRATION=true during a maintenance "
-                        "window to migrate it and enable retention/compression policies."
-                    )
-                else:
-                    await conn.execute(
-                        """
-                        SELECT create_hypertable(
-                            'vehicle_trajectory_points',
-                            'time',
-                            chunk_time_interval => INTERVAL '1 day',
-                            if_not_exists => TRUE,
-                            migrate_data => TRUE
-                        );
-                        """
-                    )
-                    trajectory_is_hypertable = True
-
-            if trajectory_is_hypertable:
-                await conn.execute(
-                    """
-                    ALTER TABLE vehicle_trajectory_points SET (
-                        timescaledb.compress,
-                        timescaledb.compress_segmentby = 'vehicle_id',
-                        timescaledb.compress_orderby = 'time DESC'
-                    );
-                    """
-                )
-                await conn.execute(
-                    "SELECT add_compression_policy('vehicle_trajectory_points', $1::interval, if_not_exists => TRUE);",
-                    f"{trajectory_compress_after_days} days",
-                )
-                await conn.execute(
-                    "SELECT add_retention_policy('vehicle_trajectory_points', $1::interval, if_not_exists => TRUE);",
-                    f"{trajectory_retention_days} days",
-                )
-                logger.info(
-                    "vehicle_trajectory_points hypertable is ready with compression after %s days and retention after %s days.",
-                    trajectory_compress_after_days,
-                    trajectory_retention_days,
-                )
-        except Exception as exc:
-            logger.warning("Failed to configure trajectory retention/compression: %s", exc)
+    await run_migrations(pool)
 
 async def flush_buffer(pool: asyncpg.Pool, buffer: list[VehicleRow]) -> None:
     if not buffer:
@@ -368,7 +149,7 @@ async def flush_buffer(pool: asyncpg.Pool, buffer: list[VehicleRow]) -> None:
                 ],
                 timeout=10,
             )
-        logger.info("Flushed %d records to the database.", len(buffer))
+        logger.debug("Flushed %d records to the database.", len(buffer))
     except Exception as exc:
         logger.error("Failed to flush vehicle position buffer: %s", exc)
 
@@ -401,7 +182,7 @@ async def flush_trajectory_buffer(
                 ],
                 timeout=10,
             )
-        logger.info("Flushed %d trajectory records to the database.", len(buffer))
+        logger.debug("Flushed %d trajectory records to the database.", len(buffer))
     except Exception as exc:
         logger.error("Failed to flush trajectory buffer: %s", exc)
 
