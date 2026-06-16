@@ -1,0 +1,76 @@
+export type DelayAlertMeta = {
+  artifact_path: string;
+  artifact_mtime: string | null;
+  artifact_exists: boolean;
+  artifact_age_seconds?: number | null;
+  latest_alert_time?: string | null;
+  latest_alert_age_seconds?: number | null;
+  status?: "fresh" | "stale" | "missing" | "error";
+  reason?: string;
+  total_count: number;
+  scored_count?: number;
+  alert_count?: number;
+  returned_count: number;
+  alerts_only: boolean;
+  source?: "realtime" | "artifact" | string;
+  model_path?: string | null;
+  threshold?: number | null;
+  context_minutes?: number | null;
+  output_freshness_seconds?: number | null;
+  sampling_seconds?: number | null;
+  alert_max_per_run?: number | null;
+  alert_min_risk?: number | null;
+  raw_alert_count?: number | null;
+  eligible_alert_count?: number | null;
+  suppressed_alert_count?: number | null;
+  persisted_prediction_count?: number | null;
+  prediction_retention_hours?: number | null;
+};
+
+export type DelayAlertRecord = {
+  vehicle_id: string;
+  time: string;
+  delay: number | null;
+  target_delay?: number | null;
+  speed: number | null;
+  line: string | null;
+  route_id: string | null;
+  state_position: string | null;
+  target_delay_delta: number | null;
+  delay_lag_1?: number | null;
+  delay_lag_2?: number | null;
+  delay_lag_3?: number | null;
+  speed_lag_1?: number | null;
+  speed_lag_2?: number | null;
+  speed_lag_3?: number | null;
+  delay_delta_1?: number | null;
+  speed_delta_1?: number | null;
+  delay_mean_3?: number | null;
+  speed_mean_3?: number | null;
+  last_stop_id?: string | null;
+  next_stop_id?: string | null;
+  last_stop_sequence?: number | null;
+  next_stop_sequence?: number | null;
+  stop_sequence_gap?: number | null;
+  seconds_since_origin?: number | null;
+  seconds_since_last_stop_arrival?: number | null;
+  seconds_since_last_stop_departure?: number | null;
+  seconds_until_next_stop_arrival?: number | null;
+  seconds_until_next_stop_departure?: number | null;
+  scheduled_next_stop_dwell_seconds?: number | null;
+  hour_of_day?: number | null;
+  day_of_week?: number | null;
+  delay_increase_risk: number;
+  raw_delay_increase_alert?: boolean;
+  delay_increase_alert: boolean;
+  alert_policy_reason?: string | null;
+  alert_rank?: number | null;
+  actual_increase_60s?: number | null;
+};
+
+export type DelayAlertsResponse = {
+  meta: DelayAlertMeta;
+  data: DelayAlertRecord[];
+};
+
+export type RiskListFilter = "all" | "on_map";
