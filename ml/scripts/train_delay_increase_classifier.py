@@ -4,7 +4,7 @@ import argparse
 import gc
 import json
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from glob import glob
 from pathlib import Path
 
@@ -27,6 +27,11 @@ from sklearn.metrics import (
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
 
+try:
+    from .wandb_utils import init_wandb_run, log_file_artifact, log_metrics, log_table
+except ImportError:
+    from wandb_utils import init_wandb_run, log_file_artifact, log_metrics, log_table
+
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 
@@ -34,6 +39,15 @@ REPO_ROOT = SCRIPT_PATH.parents[2]
 @dataclass(frozen=True)
 class LoadStats:
     eligible_rows: int | None
+
+
+@dataclass(frozen=True)
+class TrainWindow:
+    requested_days: int
+    start: datetime | None
+    end: datetime | None
+    rows_before: int
+    rows_after: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -127,6 +141,20 @@ def parse_args() -> argparse.Namespace:
         help="Maximum rows to collect from holdout test files. Use <=0 for all rows.",
     )
     parser.add_argument(
+        "--train-window-days",
+        type=int,
+        default=0,
+        help="Keep only the latest N days of train/validation rows. Use <=0 for all.",
+    )
+    parser.add_argument(
+        "--train-window-end",
+        default="",
+        help=(
+            "Optional ISO timestamp/date used as the rolling train-window end. "
+            "Defaults to the max train/validation row time."
+        ),
+    )
+    parser.add_argument(
         "--hgb-max-iter",
         type=int,
         default=200,
@@ -154,6 +182,11 @@ def parse_args() -> argparse.Namespace:
         "--model-output",
         default="",
         help="Optional path for a fitted joblib model artifact.",
+    )
+    parser.add_argument(
+        "--artifact-aliases",
+        default="latest",
+        help="Comma-separated W&B artifact aliases for model outputs. Use empty to skip aliases.",
     )
     return parser.parse_args()
 
@@ -215,6 +248,50 @@ def resolve_input_paths(
 def existing_columns(source: pl.LazyFrame, candidates: list[str]) -> list[str]:
     schema_names = set(source.collect_schema().names())
     return [column for column in candidates if column in schema_names]
+
+
+def count_eligible_rows(path: str, threshold_seconds: int) -> int:
+    source = pl.scan_parquet(path)
+    required_columns = {"delay", "target_delay"}
+    if not required_columns.issubset(source.collect_schema().names()):
+        return 0
+
+    return int(
+        source
+        .select(
+            (
+                pl.col("delay").is_not_null()
+                & pl.col("target_delay").is_not_null()
+                & ((pl.col("target_delay") - pl.col("delay")) >= threshold_seconds).is_not_null()
+            )
+            .sum()
+            .alias("eligible_rows")
+        )
+        .collect()
+        .item()
+    )
+
+
+def filter_eligible_paths(paths: list[str], threshold_seconds: int) -> list[str]:
+    eligible_paths = []
+    skipped_paths = []
+
+    for path in paths:
+        eligible_rows = count_eligible_rows(path, threshold_seconds)
+        if eligible_rows > 0:
+            eligible_paths.append(path)
+        else:
+            skipped_paths.append(path)
+
+    if skipped_paths:
+        print("\nSkipped empty feature parquet batch(es):")
+        for path in skipped_paths:
+            print(f" - {path}")
+
+    if not eligible_paths:
+        raise ValueError("No parquet batches contained eligible training rows.")
+
+    return eligible_paths
 
 
 def load_dataset(
@@ -361,6 +438,63 @@ def format_time_window(frame: pl.DataFrame) -> str:
     start = frame["time"].min()
     end = frame["time"].max()
     return f"{start} -> {end}"
+
+
+def normalize_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def parse_window_end(value: str) -> datetime | None:
+    if not value.strip():
+        return None
+    parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    return normalize_datetime(parsed)
+
+
+def filter_train_window(
+    frame: pl.DataFrame,
+    window_days: int,
+    window_end: str,
+) -> tuple[pl.DataFrame, TrainWindow]:
+    if frame.height == 0:
+        return frame, TrainWindow(window_days, None, None, 0, 0)
+
+    requested_end = parse_window_end(window_end)
+    end = requested_end or normalize_datetime(frame["time"].max())
+    start = end - timedelta(days=window_days) if window_days > 0 else None
+    filtered = frame
+    if start is not None:
+        filtered = filtered.filter(
+            (pl.col("time") >= start)
+            & (pl.col("time") <= end),
+        )
+        print(
+            "\nApplied rolling train window: "
+            f"{window_days}d ({start} -> {end}), "
+            f"rows={filtered.height}/{frame.height}",
+        )
+    else:
+        print("\nApplied rolling train window: all available train/validation rows.")
+
+    return filtered, TrainWindow(
+        requested_days=window_days,
+        start=start,
+        end=end,
+        rows_before=frame.height,
+        rows_after=filtered.height,
+    )
+
+
+def train_window_payload(window: TrainWindow) -> dict[str, int | str | None]:
+    return {
+        "requested_days": window.requested_days,
+        "start": window.start.isoformat() if window.start else None,
+        "end": window.end.isoformat() if window.end else None,
+        "rows_before": window.rows_before,
+        "rows_after": window.rows_after,
+    }
 
 
 def print_split_summary(
@@ -576,6 +710,58 @@ def print_report(name: str, y_true, y_pred, y_score) -> None:
         print("Average precision: n/a")
 
 
+def safe_roc_auc(y_true, y_score) -> float | None:
+    try:
+        return float(roc_auc_score(y_true, y_score))
+    except ValueError:
+        return None
+
+
+def safe_average_precision(y_true, y_score) -> float | None:
+    try:
+        return float(average_precision_score(y_true, y_score))
+    except ValueError:
+        return None
+
+
+def threshold_metrics(
+    prefix: str,
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    threshold: float,
+) -> dict[str, float | int]:
+    y_pred = (y_score >= threshold).astype(int)
+    alert_count = int(np.sum(y_pred))
+    return {
+        f"{prefix}/threshold": float(threshold),
+        f"{prefix}/precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        f"{prefix}/recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        f"{prefix}/f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        f"{prefix}/alerts": alert_count,
+        f"{prefix}/alert_rate": alert_count / len(y_pred),
+    }
+
+
+def event_alert_summary(
+    frame: pl.DataFrame,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    cooldown_minutes: int,
+) -> dict[str, float | int]:
+    event_mask = event_alert_mask(frame, y_pred, cooldown_minutes)
+    event_count = int(event_mask.sum())
+    positives = int(np.sum(y_true))
+    return {
+        "test/high_confidence_event_alerts": event_count,
+        "test/high_confidence_event_precision": (
+            float(np.mean(y_true[event_mask])) if event_count > 0 else 0.0
+        ),
+        "test/high_confidence_event_recall": (
+            float(np.sum(y_true[event_mask]) / positives) if positives else 0.0
+        ),
+    }
+
+
 def choose_best_f1_threshold(y_true, y_score) -> tuple[float, float, float, float]:
     best = (0.50, -1.0, 0.0, 0.0)
     for threshold in np.linspace(0.05, 0.95, 91):
@@ -730,9 +916,9 @@ def print_learning_curve(
     hgb_max_depth: int,
     hgb_max_iter: int,
     hgb_max_bins: int,
-) -> None:
+) -> list[dict[str, int | float | None]]:
     if not row_counts:
-        return
+        return []
 
     print("\nHGB learning curve")
     print(
@@ -740,6 +926,7 @@ def print_learning_curve(
         "test_roc_auc | top1_precision | threshold | test_precision | "
         "test_recall | alerts",
     )
+    rows = []
     seen_train_rows = set()
     for requested_rows in row_counts:
         train_rows = min(requested_rows, len(y_train))
@@ -775,15 +962,46 @@ def print_learning_curve(
                 test_precision = "n/a"
                 test_recall = "n/a"
                 alerts = "n/a"
+                threshold_value = None
+                test_precision_value = None
+                test_recall_value = None
+                alerts_value = None
             else:
                 threshold_value = threshold_data[0]
                 y_pred = (test_score >= threshold_value).astype(int)
-                threshold = f"{threshold_value:.2f}"
-                test_precision = (
-                    f"{precision_score(y_test, y_pred, zero_division=0):.3f}"
+                test_precision_value = precision_score(
+                    y_test,
+                    y_pred,
+                    zero_division=0,
                 )
-                test_recall = f"{recall_score(y_test, y_pred, zero_division=0):.3f}"
-                alerts = str(int(np.sum(y_pred)))
+                test_recall_value = recall_score(y_test, y_pred, zero_division=0)
+                alerts_value = int(np.sum(y_pred))
+                threshold = f"{threshold_value:.2f}"
+                test_precision = f"{test_precision_value:.3f}"
+                test_recall = f"{test_recall_value:.3f}"
+                alerts = str(alerts_value)
+
+            rows.append(
+                {
+                    "train_rows": int(train_rows),
+                    "val_avg_precision": float(val_avg_precision),
+                    "test_avg_precision": float(test_avg_precision),
+                    "test_roc_auc": float(test_roc_auc),
+                    "top1_precision": float(top1_precision),
+                    "threshold": (
+                        None if threshold_value is None else float(threshold_value)
+                    ),
+                    "test_precision": (
+                        None
+                        if test_precision_value is None
+                        else float(test_precision_value)
+                    ),
+                    "test_recall": (
+                        None if test_recall_value is None else float(test_recall_value)
+                    ),
+                    "alerts": alerts_value,
+                },
+            )
 
             print(
                 f"  {train_rows} | {val_avg_precision:.3f} | "
@@ -797,6 +1015,7 @@ def print_learning_curve(
         finally:
             del model
             gc.collect()
+    return rows
 
 
 def event_alert_mask(
@@ -975,7 +1194,37 @@ def write_model_artifact(
 def main() -> None:
     args = parse_args()
     paths = resolve_input_paths(args.input_glob, args.max_files, args.selection)
+    paths = filter_eligible_paths(paths, args.threshold_seconds)
     train_val_paths, holdout_paths = split_holdout_paths(paths, args.holdout_last_files)
+    wandb_run = init_wandb_run(
+        repo_root=REPO_ROOT,
+        job_type="train",
+        tags=["urbanpulse", "delay-increase", "hgb"],
+        config={
+            "input_glob": args.input_glob,
+            "selected_file_count": len(paths),
+            "train_val_file_count": len(train_val_paths),
+            "holdout_file_count": len(holdout_paths),
+            "max_files": args.max_files,
+            "max_rows": args.max_rows,
+            "selection": args.selection,
+            "threshold_seconds": args.threshold_seconds,
+            "min_precision": args.min_precision,
+            "include_logistic": args.include_logistic,
+            "alert_cooldown_minutes": args.alert_cooldown_minutes,
+            "train_row_cap": args.train_row_cap,
+            "holdout_last_files": args.holdout_last_files,
+            "holdout_test_max_rows": args.holdout_test_max_rows,
+            "train_window_days": args.train_window_days,
+            "train_window_end": args.train_window_end,
+            "hgb_learning_rate": args.hgb_learning_rate,
+            "hgb_max_depth": args.hgb_max_depth,
+            "hgb_max_iter": args.hgb_max_iter,
+            "hgb_max_bins": args.hgb_max_bins,
+            "model_output": args.model_output,
+            "artifact_aliases": args.artifact_aliases,
+        },
+    )
 
     if holdout_paths:
         print_path_block("Train/validation source", train_val_paths)
@@ -984,6 +1233,11 @@ def main() -> None:
             train_val_paths,
             args.max_rows,
             args.threshold_seconds,
+        )
+        frame, train_window = filter_train_window(
+            frame,
+            args.train_window_days,
+            args.train_window_end,
         )
         test_df, test_load_stats = load_dataset(
             holdout_paths,
@@ -1001,6 +1255,11 @@ def main() -> None:
         train_df, val_df = split_train_val_ordered(frame)
     else:
         frame, load_stats = load_dataset(paths, args.max_rows, args.threshold_seconds)
+        frame, train_window = filter_train_window(
+            frame,
+            args.train_window_days,
+            args.train_window_end,
+        )
         test_load_stats = None
         if frame.height < 1000:
             raise ValueError(f"Dataset is too small after loading ({frame.height} rows).")
@@ -1069,6 +1328,27 @@ def main() -> None:
     if not feature_columns:
         raise ValueError("No usable feature columns found in the training data.")
 
+    if wandb_run is not None:
+        wandb_run.config.update(
+            {
+                "rows_total": total_rows,
+                "rows_train": train_df.height,
+                "rows_val": val_df.height,
+                "rows_test": test_df.height,
+                "positive_rate": positive_rate,
+                "train_window": train_window_payload(train_window),
+                "numeric_feature_count": len(numeric_columns),
+                "categorical_feature_count": len(categorical_columns),
+                "feature_count": len(feature_columns),
+                "numeric_columns": numeric_columns,
+                "categorical_columns": categorical_columns,
+                "time_window_train": format_time_window(train_df),
+                "time_window_val": format_time_window(val_df),
+                "time_window_test": format_time_window(test_df),
+            },
+            allow_val_change=True,
+        )
+
     print(f"Numeric features: {', '.join(numeric_columns)}")
     print(
         "Categorical features: "
@@ -1090,7 +1370,7 @@ def main() -> None:
     ).astype(int)
 
     learning_curve_rows = parse_row_counts(args.learning_curve_rows)
-    print_learning_curve(
+    learning_curve_metrics = print_learning_curve(
         learning_curve_rows,
         numeric_columns,
         categorical_columns,
@@ -1106,6 +1386,22 @@ def main() -> None:
         args.hgb_max_iter,
         args.hgb_max_bins,
     )
+    log_table(wandb_run, "learning_curve", learning_curve_metrics)
+    for row in learning_curve_metrics:
+        log_metrics(
+            wandb_run,
+            {
+                "learning_curve/val_avg_precision": row["val_avg_precision"],
+                "learning_curve/test_avg_precision": row["test_avg_precision"],
+                "learning_curve/test_roc_auc": row["test_roc_auc"],
+                "learning_curve/top1_precision": row["top1_precision"],
+                "learning_curve/threshold": row["threshold"],
+                "learning_curve/test_precision": row["test_precision"],
+                "learning_curve/test_recall": row["test_recall"],
+                "learning_curve/alerts": row["alerts"],
+            },
+            step=int(row["train_rows"] or 0),
+        )
 
     logistic = None
     if args.include_logistic:
@@ -1220,7 +1516,70 @@ def main() -> None:
                 args.group_top_n,
             )
 
+    wandb_metrics = {
+        "rows/total": total_rows,
+        "rows/train": train_df.height,
+        "rows/fit_train": fit_train_df.height,
+        "rows/val": val_df.height,
+        "rows/test": test_df.height,
+        "train_window/requested_days": train_window.requested_days,
+        "train_window/rows_before": train_window.rows_before,
+        "train_window/rows_after": train_window.rows_after,
+        "positive_rate/overall": positive_rate,
+        "positive_rate/fit_train": float(fit_train_df["target_increase"].mean()),
+        "positive_rate/val": float(val_df["target_increase"].mean()),
+        "positive_rate/test": float(test_df["target_increase"].mean()),
+        "val/hgb_roc_auc": safe_roc_auc(y_val, hgb_val_score),
+        "val/hgb_average_precision": safe_average_precision(y_val, hgb_val_score),
+        "test/hgb_roc_auc": safe_roc_auc(y_test, hgb_test_score),
+        "test/hgb_average_precision": safe_average_precision(y_test, hgb_test_score),
+        "test/top_0_5_percent_precision": top_fraction_precision(
+            y_test,
+            hgb_test_score,
+            0.005,
+        ),
+        "test/top_1_percent_precision": top_fraction_precision(
+            y_test,
+            hgb_test_score,
+            0.01,
+        ),
+        "test/top_5_percent_precision": top_fraction_precision(
+            y_test,
+            hgb_test_score,
+            0.05,
+        ),
+    }
+    wandb_metrics.update(threshold_metrics("test/hgb_default", y_test, hgb_test_score, 0.5))
+    wandb_metrics.update(
+        threshold_metrics(
+            "test/best_f1",
+            y_test,
+            hgb_test_score,
+            best_f1_threshold[0],
+        )
+    )
+    if precision_threshold_value is not None:
+        precision_pred = (hgb_test_score >= precision_threshold_value).astype(int)
+        wandb_metrics.update(
+            threshold_metrics(
+                "test/high_confidence",
+                y_test,
+                hgb_test_score,
+                precision_threshold_value,
+            )
+        )
+        wandb_metrics.update(
+            event_alert_summary(
+                test_df,
+                y_test,
+                precision_pred,
+                args.alert_cooldown_minutes,
+            )
+        )
+    log_metrics(wandb_run, wandb_metrics)
+
     if args.model_output:
+        model_output_path = resolve_path(args.model_output)
         metadata = {
             "target": "target_delay_delta >= threshold_seconds",
             "threshold_seconds": args.threshold_seconds,
@@ -1252,10 +1611,30 @@ def main() -> None:
                 "val": format_time_window(val_df),
                 "test": format_time_window(test_df),
             },
+            "train_window": train_window_payload(train_window),
+            "metrics": wandb_metrics,
             "input_paths": paths,
             "holdout_last_files": args.holdout_last_files,
         }
-        write_model_artifact(resolve_path(args.model_output), hgb, metadata)
+        write_model_artifact(model_output_path, hgb, metadata)
+        artifact_aliases = parse_csv_list(args.artifact_aliases) or None
+        log_file_artifact(
+            wandb_run,
+            model_output_path,
+            name="delay-increase-hgb-model",
+            artifact_type="model",
+            aliases=artifact_aliases,
+        )
+        log_file_artifact(
+            wandb_run,
+            model_output_path.with_suffix(model_output_path.suffix + ".json"),
+            name="delay-increase-hgb-metadata",
+            artifact_type="metadata",
+            aliases=artifact_aliases,
+        )
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

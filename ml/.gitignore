@@ -1,6 +1,7 @@
 # Local data and training outputs. Keep scripts/docs in git, regenerate artifacts locally.
 data/raw/
 data/processed/
+lake/
 models/
 
 # Exported source chunks and archives can be many GB.
@@ -13,6 +14,8 @@ vehicle_positions_all_chunks.tar.gz
 *.csv
 *.csv.gz
 *.joblib
+*.duckdb
+*.duckdb.wal
 *.json
 *.log
 
@@ -20,6 +23,3 @@ vehicle_positions_all_chunks.tar.gz
 .venv/
 __pycache__/
 */__pycache__/
-
-# Local machine-specific fetch helper.
-/scripts/fetch_vehicle_exports.sh

@@ -1,15 +1,68 @@
 # ML Workspace
 
-This directory is for local model development, not for runtime services.
+This directory is used for local model development and offline data work. Most
+training and backtesting still lives here. A saved delay-increase model from
+this workspace is now loaded by the FastAPI service for minute-level realtime
+inference.
 
-Initial workflow:
+The ML workspace has been built around exported vehicle-position history. The
+first version used processed Parquet batches directly from CSV exports. The
+newer shape uses a small DuckDB and Parquet lake so historical data can be
+queried, feature datasets can be rebuilt, and model experiments can be repeated
+with less manual glue.
 
-1. Copy the exported `vehicle_positions` archive from the VPS into `ml/`.
-2. Unpack the archive into `ml/data/raw/`.
-3. Build a baseline delay dataset with `t+5min` targets.
-4. Train simple baselines before attempting any GNN model.
+## What Has Been Built
 
-Recommended first run:
+- VPS export helpers have been used to bring `vehicle_positions` history into
+  the local workspace.
+- A partitioned Parquet lake has been added under `ml/lake/`.
+- DuckDB views have been added for local analytical queries over the lake.
+- Delay feature datasets have been generated from the lake into
+  `ml/data/features/`.
+- A tabular delay-increase classifier has been trained as the first serious
+  baseline before any GNN work is attempted.
+- W&B logging has been added for training metrics, model artifacts, metadata,
+  scored alert counts, and alert JSON artifacts.
+- Scored alerts are written as JSON and served by the data API for the frontend
+  risk panel.
+
+## How It Works
+
+The current offline path looks like this.
+
+```text
+VPS CSV exports -> DuckDB and Parquet lake -> delay features -> model training -> scored alerts
+```
+
+DuckDB is used as a local analytical engine. It is not replacing PostgreSQL in
+the realtime app. PostgreSQL and TimescaleDB remain the operational store for
+live collection, replay, and short-term history.
+
+The preferred archive format is partitioned Parquet.
+
+```text
+ml/lake/vehicle_positions/service_date=YYYY-MM-DD/*.parquet
+```
+
+The local DuckDB file stores views and metadata around those Parquet files.
+
+```text
+ml/lake/urbanpulse.duckdb
+```
+
+The scored alert artifact is written here.
+
+```text
+ml/models/delay_increase_alerts.json
+```
+
+The artifact is still useful as an offline fallback. During live serving, recent
+PostgreSQL/TimescaleDB rows are scored in the FastAPI service with the saved HGB
+model, using the last few minutes of vehicle history as context.
+
+## Reference Commands
+
+The original export flow can still be reproduced with the helper scripts.
 
 ```bash
 python -m venv .venv
@@ -20,24 +73,74 @@ pip install -r ml/requirements.txt
 python ml/scripts/prepare_delay_baseline_dataset.py --all-batches
 ```
 
-`fetch_vehicle_exports.sh` downloads `vehicle_positions_*.csv.gz` from the VPS
-and packs them locally into `ml/vehicle_positions_all_chunks.tar.gz`.
-
-For large April/May exports, process raw chunks one at a time to avoid OOM:
+The DuckDB and Parquet lake is rebuilt from downloaded CSV exports with:
 
 ```bash
-POLARS_MAX_THREADS=2 ./ml/scripts/process_vehicle_exports_one_by_one.sh
+python ml/scripts/build_vehicle_positions_lake.py --force
 ```
 
-The script skips existing outputs and writes
-`ml/data/processed/delay_baseline_5min_recent_*.parquet`.
+A smaller smoke lake has been useful for checking the path quickly.
 
-Default output:
+```bash
+python ml/scripts/build_vehicle_positions_lake.py \
+  --max-files 1 \
+  --output-dir ml/lake_smoke/vehicle_positions \
+  --database ml/lake_smoke/urbanpulse.duckdb \
+  --manifest ml/lake_smoke/manifest.json \
+  --force
+```
 
-- raw chunks: `ml/data/raw/`
-- processed batches: `ml/data/processed/delay_baseline_5min_batch_*.parquet`
+The lake can be queried directly through DuckDB.
 
-Useful commands:
+```bash
+python - <<'PY'
+import duckdb
+
+con = duckdb.connect("ml/lake/urbanpulse.duckdb", read_only=True)
+print(con.execute("""
+    SELECT service_date, rows, vehicles
+    FROM vehicle_positions_daily
+    ORDER BY service_date
+    LIMIT 5
+""").fetchall())
+PY
+```
+
+The delay feature dataset is built from the lake.
+
+```bash
+python ml/scripts/build_delay_features_from_lake.py
+```
+
+By default, the latest three available service dates are written here.
+
+```text
+ml/data/features/delay_5min_duckdb/service_date=YYYY-MM-DD/part.parquet
+```
+
+Specific windows can be rebuilt when a smaller or more controlled training
+sample is needed.
+
+```bash
+python ml/scripts/build_delay_features_from_lake.py \
+  --start-date 2026-05-01 \
+  --end-date 2026-05-25 \
+  --force
+```
+
+The current classifier baseline is trained from the DuckDB-built features.
+
+```bash
+python ml/scripts/train_delay_increase_classifier.py \
+  --input-glob 'ml/data/features/delay_5min_duckdb/service_date=*/part.parquet' \
+  --max-rows 1000000 \
+  --selection spread \
+  --threshold-seconds 60 \
+  --min-precision 0.60
+```
+
+The older processed-batch path is still present and has been kept for comparison
+while the lake path settles.
 
 ```bash
 python ml/scripts/train_delay_baseline.py \
@@ -54,41 +157,14 @@ python ml/scripts/train_delay_increase_classifier.py \
   --min-precision 0.60
 ```
 
-Add `--max-files 4` when you want a faster smoke test. Without `--max-files`,
-the training scripts use every matched parquet batch and then apply `--max-rows`.
-Use `--selection last` with `--max-files` for recent-window checks.
-Use `--max-rows 0` to disable row sampling.
-
-Classifier diagnostics:
+Large April and May exports have been processed one chunk at a time when memory
+pressure appeared.
 
 ```bash
-python ml/scripts/train_delay_increase_classifier.py \
-  --input-glob 'ml/data/processed/delay_baseline_5min_batch_*.parquet' \
-  --max-rows 1000000 \
-  --threshold-seconds 60 \
-  --min-precision 0.60 \
-  --alert-cooldown-minutes 15 \
-  --train-row-cap 300000 \
-  --hgb-max-bins 127 \
-  --learning-curve-rows 50000,100000,250000,500000
+POLARS_MAX_THREADS=2 ./ml/scripts/process_vehicle_exports_one_by_one.sh
 ```
 
-Recent holdout check after adding new parquet batches:
-
-```bash
-python ml/scripts/train_delay_increase_classifier.py \
-  --input-glob 'ml/data/processed/delay_baseline_5min_batch_*.parquet' \
-  --max-rows 1000000 \
-  --threshold-seconds 60 \
-  --min-precision 0.60 \
-  --alert-cooldown-minutes 15 \
-  --train-row-cap 300000 \
-  --hgb-max-bins 127 \
-  --holdout-last-files 1 \
-  --holdout-test-max-rows 300000
-```
-
-Score prepared parquet rows with a saved model:
+The scored alert JSON is produced from a saved model.
 
 ```bash
 python ml/scripts/score_delay_increase.py \
@@ -101,50 +177,61 @@ python ml/scripts/score_delay_increase.py \
   --output ml/models/delay_increase_alerts.json
 ```
 
-The data API serves this artifact at `GET /delay-increase-alerts`.
-Docker Compose mounts `ml/models/` read-only into the API container.
+## Experiment Tracking
 
-Current targets:
+W&B has been added as optional experiment tracking. When `WANDB_API_KEY` is
+present in the repo-root `.env` file or the process environment, training and
+scoring runs are logged to the configured project. The default project is
+`urbanpulse`.
 
-- regression: predict `delay` or `delay delta` at `t + horizon`
-- classification: predict whether delay increases by at least 60 seconds
+The training run logs row counts, positive rates, HGB metrics, top-risk
+precision, high-confidence alert metrics, and the saved model files. The scoring
+run logs scored row counts, alert counts, risk summaries, and the alert JSON
+artifact used by the app.
 
-Current sampling:
+W&B can be disabled for a run with:
 
-- keep one row per vehicle per 30-second bucket
+```bash
+WANDB_MODE=disabled python ml/scripts/train_delay_increase_classifier.py
+```
 
-Current read:
+## Current Modelling Read
 
-- exact delay regression is hard. Persistence is already a strong MAE baseline
-- delay-increase classification looks more promising for a first useful model
-- 5-minute horizon is cleaner than 10-minute horizon on the current data
-- evaluate the classifier primarily with average precision, top-risk precision,
-  high-confidence alert volume, and per-group slices
-- use the learning curve before adding much more data. More history helps only
-  if validation/test average precision and top-risk precision keep rising
-- if training runs out of RAM, keep more chronological coverage with `--max-rows`
-  but cap model-fitting rows with `--train-row-cap`. Lower `--hgb-max-bins`
-  to reduce HGB memory pressure
-- use `--holdout-last-files 1` after adding fresh data to train on older
-  batches and evaluate on the newest batch as an out-of-time test
+The current targets are:
 
-HGB baseline status:
+- regression of future delay or delay delta
+- classification of whether delay increases by at least 60 seconds within five
+  minutes
 
-- the useful classical ML baseline is `HistGradientBoostingClassifier`
-- task: predict whether delay increases by at least 60 seconds within 5 minutes
-- latest recent-data holdout used 24 April/May files for train/validation and
-  the newest May 25 file as an out-of-time test
-- representative holdout metrics: ROC AUC `0.737`, average precision `0.494`,
-  top 1% precision `0.860`
-- validation-selected high-confidence threshold was about `0.74`
-- at that threshold, test precision was about `0.61` and recall about `0.25`
-- this model is a benchmark for GNN work, not the final production model
+The most useful baseline so far has been `HistGradientBoostingClassifier`.
+Regression has been harder because persistence is already a strong mean absolute
+error baseline. Delay-increase classification currently looks more useful for a
+first alerting feature.
 
-GNN later:
+The latest recent-data holdout used April and May data for training and
+validation, with the newest May 25 file treated as an out-of-time test. The
+representative holdout metrics were:
 
-- keep the HGB classifier as the tabular baseline and alerting benchmark
-- build graph snapshots from route/stop topology plus recent vehicle state
-- compare any GNN against the same chronological test windows and alert metrics
+- ROC AUC around `0.737`
+- average precision around `0.494`
+- top 1 percent precision around `0.860`
+- high-confidence test precision around `0.61`
+- high-confidence recall around `0.25`
 
-This is intentionally baseline-first. If this dataset is weak or unstable,
-fix the data shape before spending time on graph models.
+This is a benchmark for later GNN work, not a final production model.
+
+## What Comes Next
+
+- The Airflow DAG is now expected to become the main way this workflow is run.
+- W&B is becoming the place where baseline runs are compared instead of
+  relying only on console logs.
+- The local lake is expected to be synced to object storage instead of living only
+  on a laptop or VPS export.
+- The tabular baseline is being kept as the benchmark for future graph models.
+- GNN snapshots are expected to be built from route and stop topology plus
+  recent vehicle state once the data quality and chronological validation setup
+  has earned enough trust.
+
+The project is intentionally baseline-first. If the dataset is weak or unstable,
+the data shape is expected to improve before time is spent on more complex
+models.

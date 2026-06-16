@@ -7,6 +7,11 @@ from pathlib import Path
 import joblib
 import polars as pl
 
+try:
+    from .wandb_utils import init_wandb_run, log_file_artifact, log_metrics
+except ImportError:
+    from wandb_utils import init_wandb_run, log_file_artifact, log_metrics
+
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 
@@ -179,6 +184,21 @@ def output_frame_for_scope(
 
 def main() -> None:
     args = parse_args()
+    wandb_run = init_wandb_run(
+        repo_root=REPO_ROOT,
+        job_type="score",
+        tags=["urbanpulse", "delay-increase", "alerts"],
+        config={
+            "model": args.model,
+            "input_glob": args.input_glob,
+            "max_rows": args.max_rows,
+            "top_n": args.top_n,
+            "threshold": args.threshold,
+            "latest_per_vehicle": args.latest_per_vehicle,
+            "output": args.output,
+            "output_scope": args.output_scope,
+        },
+    )
     model_path = resolve_path(args.model)
     model, metadata = load_artifact(model_path)
     feature_columns = metadata.get("feature_columns")
@@ -230,10 +250,36 @@ def main() -> None:
         f"\nScored rows: {scored.height}; "
         f"alerts at threshold: {alert_count} ({alert_count / scored.height:.3%})",
     )
+    log_metrics(
+        wandb_run,
+        {
+            "score/rows": scored.height,
+            "score/alerts": alert_count,
+            "score/alert_rate": alert_count / scored.height,
+            "score/threshold": threshold,
+            "score/top_risk": float(top_rows["delay_increase_risk"].max())
+            if top_rows.height
+            else None,
+            "score/mean_top_risk": float(top_rows["delay_increase_risk"].mean())
+            if top_rows.height
+            else None,
+        },
+    )
 
     if args.output:
+        output_path = resolve_path(args.output)
         output_frame = output_frame_for_scope(scored, top_rows, args.output_scope)
-        write_output(output_frame, resolve_path(args.output))
+        write_output(output_frame, output_path)
+        log_file_artifact(
+            wandb_run,
+            output_path,
+            name="delay-increase-alerts",
+            artifact_type="predictions",
+            aliases=["latest"],
+        )
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
