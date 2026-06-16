@@ -21,9 +21,14 @@ __pycache__/
 htmlcov/
 .venv/
 venv/
+wandb/
 
 # Local scratch files
 /2026-??-??
+
+# Local Airflow runtime state.
+/airflow/logs/
+/airflow/plugins/
 
 # Local Kubernetes secrets.
 /deploy/kubernetes/secret.yaml

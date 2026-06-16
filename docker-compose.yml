@@ -1,7 +1,106 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-airflow-common: &airflow-common
+  image: urbanpulse-airflow:latest
+  build:
+    context: .
+    dockerfile: airflow/Dockerfile
+  user: "${AIRFLOW_UID:-50000}:0"
+  logging: *default-logging
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY:-urbanpulse-dev-secret}
+    AIRFLOW_ADMIN_USERNAME: ${AIRFLOW_ADMIN_USERNAME:-admin}
+    AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+    AIRFLOW_ADMIN_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@example.com}
+    POSTGRES_HOST: timescaledb
+    POSTGRES_PORT: 5432
+    POSTGRES_USER: ${POSTGRES_USER:-admin}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    POSTGRES_DB: ${POSTGRES_DB:-prague_transport}
+    URBANPULSE_REPO_DIR: /opt/urbanpulse
+    URBANPULSE_DUCKDB_MEMORY_LIMIT: ${URBANPULSE_DUCKDB_MEMORY_LIMIT:-8GB}
+    URBANPULSE_DUCKDB_THREADS: ${URBANPULSE_DUCKDB_THREADS:-2}
+    URBANPULSE_FETCH_EXPORTS: ${URBANPULSE_FETCH_EXPORTS:-false}
+    URBANPULSE_REBUILD_LAKE: ${URBANPULSE_REBUILD_LAKE:-false}
+    URBANPULSE_LAKE_INPUT_GLOB: ${URBANPULSE_LAKE_INPUT_GLOB:-ml/data/raw/vehicle_exports/vehicle_positions_*.csv.gz}
+    DOWNLOAD_DIR: ${URBANPULSE_EXPORT_DOWNLOAD_DIR:-/opt/urbanpulse/ml/data/raw/vehicle_exports}
+    ARCHIVE_PATH: ${URBANPULSE_EXPORT_ARCHIVE_PATH:-/opt/urbanpulse/ml/data/raw/vehicle_positions_all_chunks.tar.gz}
+    CREATE_ARCHIVE: ${URBANPULSE_CREATE_EXPORT_ARCHIVE:-false}
+    REMOTE_USER: ${URBANPULSE_REMOTE_USER:-}
+    REMOTE_HOST: ${URBANPULSE_REMOTE_HOST:-}
+    REMOTE_DIR: ${URBANPULSE_REMOTE_DIR:-/tmp/urbanpulse-vehicle-exports}
+    REMOTE_REPO_DIR: ${URBANPULSE_REMOTE_REPO_DIR:-/opt/urban-pulse}
+    REMOTE_EXPORT_SCRIPT: ${URBANPULSE_REMOTE_EXPORT_SCRIPT:-export_vehicle_positions.sh}
+    REMOTE_EXPORT_BEFORE_FETCH: ${URBANPULSE_REMOTE_EXPORT_BEFORE_FETCH:-true}
+    REMOTE_INCREMENTAL_EXPORT: ${URBANPULSE_REMOTE_INCREMENTAL_EXPORT:-true}
+    REMOTE_INCREMENTAL_MANIFEST: ${URBANPULSE_REMOTE_INCREMENTAL_MANIFEST:-/opt/urbanpulse/ml/lake/vehicle_positions_manifest.json}
+    REMOTE_INCREMENTAL_LOOKBACK_HOURS: ${URBANPULSE_REMOTE_INCREMENTAL_LOOKBACK_HOURS:-2}
+    REMOTE_INCREMENTAL_BOOTSTRAP_DAYS: ${URBANPULSE_REMOTE_INCREMENTAL_BOOTSTRAP_DAYS:-3}
+    REMOTE_INCREMENTAL_MAX_DAYS: ${URBANPULSE_REMOTE_INCREMENTAL_MAX_DAYS:-3}
+    REMOTE_EXPORT_DAYS: ${URBANPULSE_REMOTE_EXPORT_DAYS:-35}
+    REMOTE_EXPORT_START_TS: ${URBANPULSE_REMOTE_EXPORT_START_TS:-}
+    REMOTE_EXPORT_END_TS: ${URBANPULSE_REMOTE_EXPORT_END_TS:-}
+    REMOTE_EXPORT_SERIES_START_TS: ${URBANPULSE_REMOTE_EXPORT_SERIES_START_TS:-}
+    REMOTE_EXPORT_SERIES_END_TS: ${URBANPULSE_REMOTE_EXPORT_SERIES_END_TS:-}
+    REMOTE_EXPORT_CHUNK_HOURS: ${URBANPULSE_REMOTE_EXPORT_CHUNK_HOURS:-24}
+    REMOTE_EXPORT_SKIP_EXISTING: ${URBANPULSE_REMOTE_EXPORT_SKIP_EXISTING:-false}
+    REMOTE_EXPORT_OUTPUT_DIR: ${URBANPULSE_REMOTE_EXPORT_OUTPUT_DIR:-/tmp/urbanpulse-vehicle-exports}
+    REMOTE_CONTAINER_NAME: ${URBANPULSE_REMOTE_CONTAINER_NAME:-prague_db}
+    REMOTE_DB_USER: ${URBANPULSE_REMOTE_DB_USER:-urban}
+    REMOTE_DB_NAME: ${URBANPULSE_REMOTE_DB_NAME:-prague_transport}
+    REMOTE_DB_PASSWORD: ${URBANPULSE_REMOTE_DB_PASSWORD:-${POSTGRES_PASSWORD:-}}
+    CLEAN_DOWNLOAD_DIR_BEFORE_FETCH: ${URBANPULSE_CLEAN_DOWNLOAD_DIR_BEFORE_FETCH:-true}
+    CLEAN_REMOTE_DIR_BEFORE_EXPORT: ${URBANPULSE_CLEAN_REMOTE_DIR_BEFORE_EXPORT:-true}
+    CLEAN_REMOTE_DIR_AFTER_FETCH: ${URBANPULSE_CLEAN_REMOTE_DIR_AFTER_FETCH:-true}
+    SSH_OPTS: ${URBANPULSE_SSH_OPTS:-}
+    SCP_OPTS: ${URBANPULSE_SCP_OPTS:-}
+    URBANPULSE_FEATURE_LATEST_DATES: ${URBANPULSE_FEATURE_LATEST_DATES:-3}
+    URBANPULSE_TRAIN_MAX_ROWS: ${URBANPULSE_TRAIN_MAX_ROWS:-1000000}
+    URBANPULSE_TRAIN_ROW_CAP: ${URBANPULSE_TRAIN_ROW_CAP:-300000}
+    URBANPULSE_HOLDOUT_LAST_FILES: ${URBANPULSE_HOLDOUT_LAST_FILES:-1}
+    URBANPULSE_LEARNING_CURVE_ROWS: ${URBANPULSE_LEARNING_CURVE_ROWS:-50000,150000,300000}
+    URBANPULSE_HGB_MAX_BINS: ${URBANPULSE_HGB_MAX_BINS:-127}
+    URBANPULSE_REALTIME_EVAL_REPORT: ${URBANPULSE_REALTIME_EVAL_REPORT:-ml/reports/realtime_delay_prediction_eval.json}
+    URBANPULSE_REALTIME_EVAL_LOOKBACK_HOURS: ${URBANPULSE_REALTIME_EVAL_LOOKBACK_HOURS:-24}
+    URBANPULSE_REALTIME_EVAL_HORIZON_MINUTES: ${URBANPULSE_REALTIME_EVAL_HORIZON_MINUTES:-5}
+    URBANPULSE_REALTIME_EVAL_MATCH_TOLERANCE_SECONDS: ${URBANPULSE_REALTIME_EVAL_MATCH_TOLERANCE_SECONDS:-90}
+    URBANPULSE_REALTIME_EVAL_POSITIVE_DELTA_SECONDS: ${URBANPULSE_REALTIME_EVAL_POSITIVE_DELTA_SECONDS:-60}
+    URBANPULSE_REALTIME_EVAL_MIN_LABELED_ROWS: ${URBANPULSE_REALTIME_EVAL_MIN_LABELED_ROWS:-30}
+    URBANPULSE_REALTIME_EVAL_MAX_PREDICTIONS: ${URBANPULSE_REALTIME_EVAL_MAX_PREDICTIONS:-20000}
+    URBANPULSE_REALTIME_EVAL_SCORE_SOURCE: ${URBANPULSE_REALTIME_EVAL_SCORE_SOURCE:-realtime}
+    URBANPULSE_REALTIME_EVAL_FAIL_ON_EMPTY: ${URBANPULSE_REALTIME_EVAL_FAIL_ON_EMPTY:-false}
+    WANDB_API_KEY: ${WANDB_API_KEY:-}
+    WANDB_PROJECT: ${WANDB_PROJECT:-urbanpulse}
+    WANDB_ENTITY: ${WANDB_ENTITY:-}
+    WANDB_MODE: ${WANDB_MODE:-online}
+    WANDB_RUN_GROUP: ${WANDB_RUN_GROUP:-airflow-urbanpulse-ml-alerts}
+    WANDB_SILENT: ${WANDB_SILENT:-true}
+  volumes:
+    - .:/opt/urbanpulse
+    - ./airflow/dags:/opt/airflow/dags:ro
+    - ./airflow/logs:/opt/airflow/logs
+    - ${HOME}/.ssh:/home/airflow/.ssh:ro
+  depends_on:
+    airflow-postgres:
+      condition: service_healthy
+    timescaledb:
+      condition: service_started
+  networks:
+    - urban-pulse
+
 services:
   redis:
     image: redis:alpine
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     command:
@@ -25,6 +124,7 @@ services:
       image: timescale/timescaledb-ha:pg14-latest
       container_name: prague_db
       restart: always
+      logging: *default-logging
       environment:
         POSTGRES_USER: ${POSTGRES_USER:-admin}
         POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
@@ -33,6 +133,7 @@ services:
         - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
       volumes:
         - ./db/init:/docker-entrypoint-initdb.d:ro
+        - postgres_data:/home/postgres/pgdata
       networks:
         - urban-pulse
 
@@ -40,6 +141,7 @@ services:
       image: dpage/pgadmin4
       container_name: pgadmin
       restart: always
+      logging: *default-logging
       environment:
         PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@admin.com}
         PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:?set PGADMIN_DEFAULT_PASSWORD in .env}
@@ -54,11 +156,14 @@ services:
   data-api:
     build:
       context: ./apps/data-service
+    restart: unless-stopped
+    logging: *default-logging
     command: uvicorn main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
     depends_on:
       - redis
+      - timescaledb
     environment:
       - GOLEMIO_API_KEY=${GOLEMIO_API_KEY}
       - REDIS_HOST=redis
@@ -69,17 +174,36 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-}
       - POSTGRES_DB=${POSTGRES_DB:-prague_transport}
       - DELAY_ALERTS_PATH=/app/ml/models/delay_increase_alerts.json
+      - REALTIME_DELAY_MODEL_PATH=${REALTIME_DELAY_MODEL_PATH:-/app/ml/models/delay_increase_hgb_5min.joblib}
+      - REALTIME_INFERENCE_ENABLED=${REALTIME_INFERENCE_ENABLED:-true}
+      - REALTIME_INFERENCE_INTERVAL_SECONDS=${REALTIME_INFERENCE_INTERVAL_SECONDS:-60}
+      - REALTIME_INFERENCE_CONTEXT_MINUTES=${REALTIME_INFERENCE_CONTEXT_MINUTES:-20}
+      - REALTIME_INFERENCE_OUTPUT_FRESHNESS_SECONDS=${REALTIME_INFERENCE_OUTPUT_FRESHNESS_SECONDS:-180}
+      - REALTIME_INFERENCE_SAMPLING_SECONDS=${REALTIME_INFERENCE_SAMPLING_SECONDS:-30}
+      - REALTIME_INFERENCE_MAX_ROWS=${REALTIME_INFERENCE_MAX_ROWS:-5000}
+      - REALTIME_INFERENCE_STALE_SECONDS=${REALTIME_INFERENCE_STALE_SECONDS:-180}
+      - REALTIME_ALERT_MAX_PER_RUN=${REALTIME_ALERT_MAX_PER_RUN:-25}
+      - REALTIME_ALERT_MIN_RISK=${REALTIME_ALERT_MIN_RISK:-0.8}
+      - REALTIME_PREDICTION_PERSISTENCE_ENABLED=${REALTIME_PREDICTION_PERSISTENCE_ENABLED:-true}
+      - REALTIME_PREDICTION_MAX_PERSISTED_PER_RUN=${REALTIME_PREDICTION_MAX_PERSISTED_PER_RUN:-500}
+      - REALTIME_PREDICTION_RETENTION_HOURS=${REALTIME_PREDICTION_RETENTION_HOURS:-72}
+      - PREDICTIONS_RETENTION_DAYS=${PREDICTIONS_RETENTION_DAYS:-7}
+      - PREDICTIONS_COMPRESS_AFTER_DAYS=${PREDICTIONS_COMPRESS_AFTER_DAYS:-1}
     volumes:
       - ./ml/models:/app/ml/models:ro
+      - ./ml/reports:/app/ml/reports:ro
     networks:
       - urban-pulse
 
   data-worker:
     build:
       context: ./apps/data-service
+    restart: unless-stopped
+    logging: *default-logging
     command: python logger.py
     depends_on:
       - redis
+      - timescaledb
     environment:
       - GOLEMIO_API_KEY=${GOLEMIO_API_KEY}
       - REDIS_HOST=redis
@@ -89,6 +213,8 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-admin}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-}
       - POSTGRES_DB=${POSTGRES_DB:-prague_transport}
+      - PREDICTIONS_RETENTION_DAYS=${PREDICTIONS_RETENTION_DAYS:-7}
+      - PREDICTIONS_COMPRESS_AFTER_DAYS=${PREDICTIONS_COMPRESS_AFTER_DAYS:-1}
     networks:
       - urban-pulse
 
@@ -96,6 +222,8 @@ services:
   realtime-gateway:
     build:
       context: ./apps/realtime-gateway
+    restart: unless-stopped
+    logging: *default-logging
     depends_on:
       - redis
     environment:
@@ -110,15 +238,80 @@ services:
   frontend:
     build:
       context: ./apps/frontend
+    restart: unless-stopped
+    logging: *default-logging
     depends_on:
       - realtime-gateway
     ports:
       - "5173:5173"
     environment:
       - VITE_WS_URL=${VITE_WS_URL:-ws://127.0.0.1:${GATEWAY_PORT:-3000}/ws}
+      - VITE_API_URL=${VITE_API_URL:-http://127.0.0.1:8000}
     networks:
       - urban-pulse
+
+  airflow-postgres:
+    image: postgres:16-alpine
+    profiles:
+      - airflow
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - urban-pulse
+
+  airflow-init:
+    <<: *airflow-common
+    profiles:
+      - airflow
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        airflow db migrate
+        airflow users create \
+          --username "$${AIRFLOW_ADMIN_USERNAME:-admin}" \
+          --password "$${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname Urban \
+          --lastname Pulse \
+          --role Admin \
+          --email "$${AIRFLOW_ADMIN_EMAIL:-admin@example.com}" || true
+
+  airflow-webserver:
+    <<: *airflow-common
+    profiles:
+      - airflow
+    command: webserver
+    ports:
+      - "127.0.0.1:${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    profiles:
+      - airflow
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
 
 networks:
   urban-pulse:
     driver: bridge
+
+volumes:
+  postgres_data:
+  airflow_postgres_data:
